@@ -52,6 +52,8 @@ The first generation also fetches the text encoder into the local cache. With **
 
 Each prompt clip can contain one or more reference images assigned to target frames. For a **human**, choose the image, click **Estimate Human Pose**, review or change the human bone mapping, click **Preview Estimated Pose**, adjust the rig if needed, and click **Capture Current Pose**. For a **creature**, use the image as a guide to pose the rig manually, then capture it. The captured pose is the actual constraint; selecting an image alone does not impose a pose. It fixes the joint rotations, root height and facing direction at its frame, while the model still generates the horizontal travel. Uncaptured references stop generation with an error.
 
+Posecode users can choose **Import Posecode Manifest** in the timeline view to load prompts and encoded key-pose references from a `posecode.unimate.constraints.v1` JSON export. The first version targets meter-scale Mixamo-style human rigs; see the panel guide for its FPS, naming, and pre-IK contact limitations.
+
 **Prompt blend frames** smooth joins between clips. **Pose approach frames** ease into a captured reference within its clip. Both controls can be set to zero. Cleanup may adjust an intersecting captured pose; turn it off when exact reference rotations matter more. Single-image human pose estimation cannot reliably infer hidden limbs, depth, or ground contact, so review every estimate.
 
 ## Scope and limits

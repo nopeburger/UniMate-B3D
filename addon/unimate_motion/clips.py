@@ -11,6 +11,7 @@ from bpy.props import StringProperty, IntProperty, BoolProperty, CollectionPrope
 from bpy_extras.io_utils import ImportHelper
 from .rig import export_skeleton
 from .poses import ROLES, auto_mapping, capture_pose, preview_estimate
+from .posecode import build_schedule as build_posecode_schedule, load_manifest as load_posecode_manifest
 from .schedule import validate_clips
 
 _previews = None
@@ -87,6 +88,49 @@ class UNIMATE_OT_clip_remove(bpy.types.Operator):
             s.clips.remove(min(s.clip_index, len(s.clips)-1))
             s.clip_index = max(0, min(s.clip_index, len(s.clips)-1))
         return {"FINISHED"}
+
+class UNIMATE_OT_import_posecode(bpy.types.Operator, ImportHelper):
+    bl_idname = "unimate.import_posecode"
+    bl_label = "Import Posecode Manifest"
+    bl_description = "Import prompts and encoded key-pose references from a Posecode constraint manifest"
+    bl_options = {"REGISTER", "UNDO"}
+    filename_ext = ".json"
+    filter_glob: StringProperty(default="*.json", options={"HIDDEN"})
+    def execute(self, context):
+        from . import selected_rig
+        settings = context.scene.unimate_motion
+        try:
+            if settings.family != "mixamo":
+                raise ValueError("Posecode manifests currently require Character: Human.")
+            rig = selected_rig(context)
+            skeleton = export_skeleton(rig, settings.forward, settings.tips)
+            manifest = load_posecode_manifest(self.filepath)
+            schedule = build_posecode_schedule(manifest, skeleton)
+            validate_clips(schedule, skeleton["signature"])
+            scene_fps = context.scene.render.fps / context.scene.render.fps_base
+            manifest_fps = manifest["timing"]["fps"]
+            if abs(scene_fps - manifest_fps) > .001:
+                raise ValueError(
+                    f"Set the Blender scene to {manifest_fps} FPS before importing this Posecode manifest."
+                )
+            settings.clips.clear()
+            for source in schedule:
+                clip = settings.clips.add()
+                clip.prompt, clip.start, clip.end = source["prompt"], source["start"], source["end"]
+                for captured in source["references"]:
+                    reference = clip.references.add()
+                    reference.uid = uuid.uuid4().hex
+                    reference.frame = captured["frame"]
+                    reference.pose_json = json.dumps(captured["pose"], separators=(",", ":"))
+            settings.mode = "TIMELINE"
+            settings.clip_index = 0
+            settings.start_frame = schedule[0]["start"]
+            settings.status = f"Imported {len(schedule)} Posecode clips with {len(manifest['keyframes'])} key poses"
+            self.report({"INFO"}, settings.status)
+            return {"FINISHED"}
+        except Exception as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
 
 class UNIMATE_OT_reference_add(bpy.types.Operator):
     bl_idname = "unimate.reference_add"
@@ -239,6 +283,7 @@ def draw_timeline(layout, context):
     global _previews
     from . import selected_rig
     s = context.scene.unimate_motion
+    layout.operator("unimate.import_posecode", icon="IMPORT")
     row = layout.row()
     row.template_list("UNIMATE_UL_clips", "", s, "clips", s, "clip_index", rows=3)
     col = row.column(align=True)
@@ -299,6 +344,7 @@ def cleanup():
         _previews = None
 
 CLASSES = (UniMateReference, UniMateClip, UniMateBoneMapping, UNIMATE_UL_clips,
-    UNIMATE_OT_clip_add, UNIMATE_OT_clip_remove, UNIMATE_OT_reference_add, UNIMATE_OT_reference_remove,
+    UNIMATE_OT_clip_add, UNIMATE_OT_clip_remove, UNIMATE_OT_import_posecode,
+    UNIMATE_OT_reference_add, UNIMATE_OT_reference_remove,
     UNIMATE_OT_reference_image, UNIMATE_OT_map_human, UNIMATE_OT_estimate_pose,
     UNIMATE_OT_preview_pose, UNIMATE_OT_capture_pose)
