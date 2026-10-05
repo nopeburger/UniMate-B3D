@@ -136,57 +136,87 @@ def pose_bridge(root, local, start, target, incoming=True):
         root[start+t] = start_root + weight*(target_root-start_root) + h*root_tangent
 
 
-def finish_motion(root, local, clips, skeleton, transition_frames, pose_approach_frames):
-    """Deterministic editing of neural motion; reference approaches are pose blends."""
+def inertialize(root, local, cursor, end):
+    """Blend frames cursor..end-1 so motion continues from frame cursor-1.
+
+    Extrapolates the preceding motion one frame and decays only the position
+    and velocity gaps, for the root and every joint rotation. Adding the whole
+    preceding velocity instead of the gap double-counted motion (the hips
+    lurched to old + new speed, then stopped hard); snapping to the previous
+    pose froze every joint for a frame.
+    """
     from scipy.spatial.transform import Rotation
+    n = end-cursor
+    if cursor < 1 or n < 1 or cursor+1 >= len(root):
+        return
+    def step(a, b):  # per-joint rotation taking b to a, as rotation vectors
+        return Rotation.from_matrix((a @ b.swapaxes(-1,-2)).reshape(-1,3,3)).as_rotvec()
+    previous_spin = step(local[cursor-1], local[cursor-2]) if cursor > 1 else np.zeros((local.shape[1], 3))
+    extrapolated = Rotation.from_rotvec(previous_spin).as_matrix() @ local[cursor-1]
+    rot_error = step(extrapolated, local[cursor])
+    spin_error = previous_spin-step(local[cursor+1], local[cursor])
+    previous_velocity = root[cursor-1]-root[cursor-2] if cursor > 1 else np.zeros(3)
+    root_error = root[cursor-1]+previous_velocity-root[cursor]
+    velocity_error = previous_velocity-(root[cursor+1]-root[cursor])
+    for t in range(n):
+        weight = 1-ease(t/n)
+        local[cursor+t] = Rotation.from_rotvec((rot_error+spin_error*t)*weight).as_matrix() @ local[cursor+t]
+        root[cursor+t] += (root_error + velocity_error*t)*weight
+
+
+def finish_motion(root, local, clips, skeleton, transition_frames, pose_approach_frames, window_seams=()):
+    """Deterministic editing of neural motion; reference approaches are pose blends.
+
+    Joins (between clips, and between chained model windows inside a clip)
+    are inertialized. Each captured reference is approached and left with
+    pose blends, so it stays exact.
+    """
     cursor = 0
     for clip in clips:
         count = clip["end"]-clip["start"]+1
         refs = sorted(clip.get("references", []), key=lambda r: r["frame"])
-        # Inertial correction starts at the preceding pose and decays smoothly.
-        # Stop before a reference so exact captured targets are never displaced.
-        end = min(cursor+transition_frames, cursor+count-1)
-        if refs:
-            end = min(end, cursor+refs[0]["frame"]-clip["start"])
-        if cursor and end > cursor:
-            n = end-cursor
-            rot_error = Rotation.from_matrix(local[cursor-1] @ local[cursor].swapaxes(-1,-2)).as_rotvec()
-            root_error = root[cursor-1]-root[cursor]
-            root_velocity = root[cursor-1]-root[cursor-2] if cursor > 1 else np.zeros(3)
-            for t in range(n):
-                u = t/n
-                weight = 1-ease(u)
-                local[cursor+t] = Rotation.from_rotvec(rot_error*weight).as_matrix() @ local[cursor+t]
-                root[cursor+t] += root_error*weight + root_velocity*(t+1)*weight
-        # Each reference is approached from an earlier pose with zero endpoint speed.
-        # Local rotations avoid collapsing limbs as their parents turn.
+        targets = [cursor+ref["frame"]-clip["start"] for ref in refs]
+        # Joins never blend across a reference, so captured targets stay exact.
+        joins = ([cursor] if cursor else []) + [seam for seam in window_seams if cursor < seam < cursor+count]
+        for join in joins:
+            end = min([join+transition_frames, cursor+count-1] + [t for t in targets if t >= join])
+            inertialize(root, local, join, end)
+        # Each reference is approached from an earlier pose with zero endpoint
+        # speed; local rotations avoid collapsing limbs as their parents turn.
         previous_ref = cursor-1 if cursor else 0
-        for ref in refs:
-            target = cursor+ref["frame"]-clip["start"]
+        starts = []
+        for target in targets:
             start = max(previous_ref, target-pose_approach_frames)
+            starts.append(start)
             if pose_approach_frames and target > start:
                 pose_bridge(root, local, start, target)
             previous_ref = target
-        # A reference inside a clip must also leave smoothly. The next reference's
-        # approach already handles inter-reference intervals; release only the last.
-        if refs and pose_approach_frames and transition_frames:
-            target = cursor+refs[-1]["frame"]-clip["start"]
-            release = min(target+transition_frames, cursor+count-1)
-            if release > target:
-                pose_bridge(root, local, target, release, incoming=False)
+        # Every reference is also left smoothly, up to where the next approach
+        # begins. Only releasing the last one left a pop after earlier ones.
+        if pose_approach_frames and transition_frames:
+            for index, target in enumerate(targets):
+                limit = starts[index+1] if index+1 < len(targets) else cursor+count-1
+                release = min(target+transition_frames, limit)
+                if release > target:
+                    pose_bridge(root, local, target, release, incoming=False)
         cursor += count
     return forward_kinematics(root, local, skeleton)
 
 
 def retime(positions, rotations, spans, clips, skeleton,
-           transition_frames=12, pose_approach_frames=60):
-    """Resample each clip's generated frames (spans) onto its frame range."""
+           transition_frames=12, pose_approach_frames=60, seams=None):
+    """Resample each clip's generated frames (spans) onto its frame range.
+
+    seams lists, per clip, the generated-frame offsets (from the clip's span
+    start) where a chained model window begins; those joins are smoothed too.
+    """
     from scipy.spatial.transform import Rotation, Slerp
     if not 0 <= transition_frames <= 120 or not 0 <= pose_approach_frames <= 600:
         raise ValueError("Invalid transition or pose approach duration.")
     local = to_local(rotations, skeleton["parents"])
-    all_root, all_local = [], []
-    for (begin, end), clip in zip(spans, clips):
+    all_root, all_local, window_seams = [], [], []
+    cursor = 0
+    for index, ((begin, end), clip) in enumerate(zip(spans, clips)):
         root, rot = positions[begin:end, 0], local[begin:end]
         duration = clip["end"] - clip["start"] + 1
         knots = {0: 0, duration-1: len(root)-1}
@@ -205,5 +235,8 @@ def retime(positions, rotations, spans, clips, skeleton,
         for joint in range(rot.shape[1]):
             output[:, joint] = Slerp(np.arange(len(root)), Rotation.from_matrix(rot[:,joint]))(sample_times).as_matrix()
         all_local.append(output)
+        for seam in (seams[index] if seams else []):
+            window_seams.append(cursor + int(np.searchsorted(sample_times, seam)))
+        cursor += duration
     return finish_motion(np.concatenate(all_root), np.concatenate(all_local), clips,
-                         skeleton, transition_frames, pose_approach_frames)
+                         skeleton, transition_frames, pose_approach_frames, window_seams)

@@ -7,7 +7,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/"backend"))
-from timeline import retime, forward_kinematics, to_local, smooth_motion
+from timeline import retime, forward_kinematics, to_local, native_index, smooth_motion
 spec = importlib.util.spec_from_file_location("geometry", ROOT/"addon/unimate_motion/motion.py")
 geo = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(geo)
@@ -59,10 +59,39 @@ for duration in [2,60,300]:
     pp,rr=retime(raw_pos,raw_rot,[(0,60),(60,110)],plain,skel,12,0)
     assert len(pp)==60+duration
     fixed_offsets(pp,rr)
-    assert np.allclose(rr[60],rr[59],atol=1e-8)
+    # The join continues the previous clip's motion: no frozen frame (the old
+    # blend repeated the last pose) and no jump in rotation or root speed.
+    def turn(a,b):
+        return np.degrees(Rotation.from_matrix((a.swapaxes(-1,-2)@b).reshape(-1,3,3)).magnitude())
+    before,at=turn(rr[58],rr[59]),turn(rr[59],rr[60])
+    assert np.abs(at-before).max()<1.5, ("Join changes rotation speed", np.abs(at-before).max())
+    v_before,v_at=pp[59,0]-pp[58,0],pp[60,0]-pp[59,0]
+    assert np.linalg.norm(v_at-v_before)<.2*np.linalg.norm(v_before)+1e-4, "Join changes root speed"
+# A jump at a chained-window join inside a clip, and right after the first of
+# two references, is smoothed; references stay exact.
+def stepped(jump_at, frames=110):
+    local=np.tile(np.eye(3),(frames,5,1,1))
+    for t in range(frames):
+        angle=.01*t+(.6 if t>=jump_at else 0)
+        local[t,1]=Rotation.from_rotvec([0,0,angle]).as_matrix()
+    root=np.column_stack([np.linspace(0,1,frames),np.zeros(frames),np.ones(frames)])
+    return forward_kinematics(root,local,synthetic)
+def worst_jerk(p,lo,hi):
+    return np.linalg.norm(np.diff(p[lo:hi],2,axis=0),axis=-1).max()
+sp,sr=stepped(60)
+clip=[dict(start=1,end=90,references=[])]
+smoothed,_=retime(sp,sr,[(0,110)],clip,synthetic,12,60,seams=[[60]])
+unsmoothed,_=retime(sp,sr,[(0,110)],clip,synthetic,12,60)
+assert worst_jerk(unsmoothed,40,60)>.3 and worst_jerk(smoothed,40,60)<.05, (worst_jerk(unsmoothed,40,60),worst_jerk(smoothed,40,60))
+sp,sr=stepped(22,60)
+two=[dict(start=1,end=120,references=[dict(frame=40),dict(frame=120)])]
+p2,r2=retime(sp,sr,[(0,60)],two,synthetic,12,30)
+assert worst_jerk(p2,38,60)<.05, worst_jerk(p2,38,60)
+source_local=to_local(sr,synthetic["parents"])
+assert np.allclose(to_local(r2,synthetic["parents"])[39],source_local[native_index(two[0],two[0]["references"][0],60)],atol=1e-8)
 # Window planning: one window reproduces the old single-window mapping; long
 # clips chain windows and keep each reference on its proportional frame.
-from timeline import plan_windows, native_index
+from timeline import plan_windows
 plan=plan_windows(request["clips"],60,10)
 assert [c for c,_ in plan]==[0,1] and sorted(plan[1][1])==[59]
 assert plan_windows(request["clips"],60,10,extend=False)==plan
@@ -108,7 +137,7 @@ _free=dict(_sk2,foot_profiles=[])
 _pu,_ru=smooth_motion(_p2,_r2,_free,3.0)
 _amp=lambda p:np.ptp(p[10:-10,3]-p[10:-10,0],axis=0).max()
 assert _amp(_ps2)>_amp(_pu)*1.5 and _amp(_ps2)>_amp(_p2)*.5
-report=dict(passed=["window planning","chained reference slots","exact reference frame","earlier prompt preserved","no sit rotation spike",
+report=dict(passed=["window joins smoothed","reference exits smoothed","window planning","chained reference slots","exact reference frame","earlier prompt preserved","no sit rotation spike",
                     "no endpoint root snap","FK bone lengths","disable editing",
                     "multiple and first-frame references","interior reference release",
                     "short and stretched clips","motion smoothing","limbs keep their swing"],
