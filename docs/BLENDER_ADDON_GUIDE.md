@@ -129,3 +129,9 @@ Expand **Setup and generation settings** to configure the backend and less commo
 For non-human rigs the model often follows the prompt weakly. Slithering, swimming and in-place spins usually need **Text guidance** around **5–7**; compare with a fixed seed.
 
 The final **Experimental · simple deform rigs** line is a scope reminder, not a setting. The panel does not offer obstacle-aware path planning or a guarantee of collision-free output. For a jump over a specific cube, review and edit the resulting Action against the scene; the [included demo](../demo/UniMate_Run_Jump_Sword.blend) shows such an edited action.
+
+## Example: run, jump and kick
+
+![A Mixamo character runs, jumps and kicks, generated as one three-prompt timeline](../demo/media/mixamo-run-jump-kick.gif)
+
+This 210-frame timeline uses a Mixamo character with **Mixamo model for humans** on and seed 21. The clips are *"A human runs forward."* (frames 1–90), *"A human jumps far forward with both feet and lands."* (91–150) and *"A human does a front kick with the right leg."* (151–210). The model generated the motion without seeing the scene; the cube and cylinder were placed afterwards to match. If a prompt does not give the action you want, change the wording or the seed and compare takes, as this demo did before settling on these.
