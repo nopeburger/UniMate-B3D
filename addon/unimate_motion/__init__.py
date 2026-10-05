@@ -448,9 +448,9 @@ class UNIMATE_PT_main(bpy.types.Panel):
         layout.prop(settings, "advanced", icon="TRIA_DOWN" if settings.advanced else "TRIA_RIGHT", emboss=False)
         if settings.advanced:
             layout.prop(settings, "ground_object")
-            layout.prop(settings, "settle_to_ground")
             layout.prop(settings, "tips")
             layout.prop(settings, "fingers")
+            layout.prop(settings, "settle_to_ground")
             layout.prop(settings, "guidance")
             layout.prop(settings, "fps")
             layout.prop(settings, "overlap")
