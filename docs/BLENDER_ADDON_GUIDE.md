@@ -103,6 +103,22 @@ Prompts work best when they name the creature and describe one action, in the pl
 
 Cleanup treats wings as part of the body for self-collision and does not know about air or water, so a creature that is meant to fly or swim will not be pushed to the ground; only the contact bones are kept above it.
 
+### Known weak results
+
+The model follows some bodies and actions much better than others. These are the weak spots found in testing with procedural stand-in rigs (a spider, crab, bird, dragon, snake, fish, quadruped robot, wheeled robot and plant) and the Mixamo character; a real rig may do better or worse. Generate several seeds, compare them, and use pose references or hand edits where the motion matters.
+
+| Body or action | What you may see | What helps |
+| --- | --- | --- |
+| **Snakes and other chains**: slithering | The body holds one bend, a hairpin or a J, and tumbles with it instead of passing a wave along its length. It can also move very fast. A tail-rooted chain of 15 or 30 bones did no better than a root in the middle, and the v3 preview kept the snake nearly straight. | **Text guidance** 7–10 and several seeds. For an exact serpentine gait, animate the wave yourself, for example with driven bone rotations. |
+| **Fish, whales and other swimmers**: swimming, tail sweeps | The spine bends and often stays bent instead of swinging back and forth, the tail fin barely moves, and the body can tumble rather than travel. | **Text guidance** 7 and several seeds. Treat the result as a base to edit. |
+| **Wheeled or tracked robots**: spinning in place | The turn stops well short of a full rotation or swings back, and the arms wave, so it reads as dancing rather than spinning. | **Text guidance** around 7. Rotate the object yourself and use the generated arms and body motion on top. |
+| **Spiders, crabs and other many-legged bodies**: walking | Legs can cross over each other or splay at odd angles, and a sideways crab walk covers little ground. The v3 preview holds a steadier stance but travels even less. | Leave **Self-collision** and **Plant feet** on **Auto**, which keeps the legs as the model generated them, and try several seeds. |
+| **Dragons and other long-necked creatures**: walking, taking off | The head and neck jitter, and the take-off can be erratic. | **Motion smoothing** 1.5–2.5, which calms the head and neck while keeping most of the leg swing. The v3 preview walks much more steadily. |
+| **Plants**: swaying in the wind | The motion can look jumpy, with odd bends. | **Motion smoothing**, a lower **Text guidance** (about 3), and **Fixed base** so the root stays put. |
+| **Humans on the floor**: crawling, sitting down onto the ground, lying down | The hands and knees may not land flat, the legs can fold the wrong way, and the change from standing is not natural. | Use pose references at the key poses. See the note on floor-level actions in the README. |
+
+Actions that depend on the scene, such as jumping over a particular cube, are not planned by the model at all; see the scope note after the settings table.
+
 ## Setup and generation settings
 
 ![Expanded setup and generation settings](images/panel-advanced.png)
