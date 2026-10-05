@@ -89,6 +89,8 @@ Each job lives under the configured project's local `outputs/` folder and contai
 
 The model was trained on bipeds, quadrupeds, birds, insects and spiders, fish and sea creatures, snakes, and articulated objects such as robots, plants and machines. Rigs with many legs, wings, tails or no limbs at all work the same way as a human rig. These settings matter:
 
+![Panel for a creature rig: Character set to Animal / Creature, with contact bones and cleanup options](images/panel-creature.png)
+
 | Setting | What to do |
 | --- | --- |
 | **Character** | **Human** for people (and the only choice that can use the Mixamo model). **Animal / Creature** for anything with legs, wings, fins or a tail that is a living thing: dogs, birds, spiders, crabs, dragons, snakes, fish. **Other articulated model** for robots, plants, cameras, arms and other objects. If a Human rig has more than two contact bones, **Check Rig** suggests Animal / Creature. |
