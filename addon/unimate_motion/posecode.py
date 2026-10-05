@@ -198,12 +198,79 @@ def encode_keyframe(keyframe, skeleton, mapping):
         else:
             deltas[index] = basis.T @ root_delta @ basis
 
+    for side in ("left", "right"):
+        _share_with_clavicle(deltas, parents, heads, mapping, by_index, side)
+
     positions = np.zeros_like(heads)
     translation = basis.T @ np.asarray(root["positionMeters"], dtype=float)
     positions[0] = heads[0] + translation
     for index, parent in enumerate(parents[1:], 1):
         positions[index] = positions[parent] + deltas[parent] @ (heads[index] - heads[parent])
     return encode_pose(positions, deltas, skeleton)
+
+
+# Shoulder rhythm: the clavicle/scapula carry about a third of upper-arm
+# elevation. Posecode has no clavicle, so without this the whole raise lands
+# on the ball joint and skinned shoulders pinch.
+CLAVICLE_SHARE = 1 / 3
+CLAVICLE_MAX_UP = math.radians(30)
+CLAVICLE_MAX_DOWN = math.radians(10)
+
+
+def _share_with_clavicle(deltas, parents, heads, mapping, by_index, side):
+    """Share upper-arm swing with an unbound clavicle without changing arm rotation."""
+    arm = mapping.get(f"shoulder_{side}")
+    if arm is None:
+        return
+    clavicle = parents[arm]
+    if clavicle <= 0 or clavicle in by_index:
+        return
+    chest = parents[clavicle]
+    relative = deltas[chest].T @ deltas[arm]
+    axis, angle = _axis_angle(relative)
+    if angle < 1e-6:
+        return
+
+    # Swing only: twist about the upper arm's rest direction stays at the arm.
+    children = [joint for joint, parent in enumerate(parents) if parent == arm]
+    if not children:
+        return
+    bone = heads[children[0]] - heads[arm]
+    bone /= np.linalg.norm(bone)
+    swing = axis * angle
+    swing -= bone * (swing @ bone)
+    angle = float(np.linalg.norm(swing))
+    if angle < 1e-6:
+        return
+    raised = (_rotation(swing / angle, angle) @ bone)[2] > bone[2]
+    limit = CLAVICLE_MAX_UP if raised else CLAVICLE_MAX_DOWN
+    deltas[clavicle] = deltas[chest] @ _rotation(
+        swing / angle, min(angle * CLAVICLE_SHARE, limit)
+    )
+
+
+def _axis_angle(matrix):
+    angle = math.acos(max(-1.0, min(1.0, (np.trace(matrix) - 1) / 2)))
+    if angle < 1e-8:
+        return np.array([1.0, 0.0, 0.0]), 0.0
+    if math.pi - angle < 1e-4:
+        # Near 180 degrees the antisymmetric part vanishes; use the diagonal.
+        axis = np.sqrt(np.maximum((np.diag(matrix) + 1) / 2, 0))
+        axis[1] = math.copysign(axis[1], matrix[0, 1] + matrix[1, 0])
+        axis[2] = math.copysign(axis[2], matrix[0, 2] + matrix[2, 0])
+        return axis / np.linalg.norm(axis), angle
+    axis = np.array([
+        matrix[2, 1] - matrix[1, 2],
+        matrix[0, 2] - matrix[2, 0],
+        matrix[1, 0] - matrix[0, 1],
+    ])
+    return axis / np.linalg.norm(axis), angle
+
+
+def _rotation(axis, angle):
+    x, y, z = axis
+    cross = np.array(((0, -z, y), (z, 0, -x), (-y, x, 0)), dtype=float)
+    return np.eye(3) + math.sin(angle) * cross + (1 - math.cos(angle)) * (cross @ cross)
 
 
 def _match_bones(bindings, skeleton):

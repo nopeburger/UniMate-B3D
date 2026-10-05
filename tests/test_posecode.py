@@ -1,4 +1,5 @@
 import importlib.util
+import math
 import sys
 import types
 import unittest
@@ -58,6 +59,34 @@ def skeleton():
     }
 
 
+def skeleton_with_clavicles():
+    names = [
+        "mixamorigHips", "mixamorig:Spine", "mixamorig:Spine2", "mixamorig:Neck", "mixamorig:Head",
+        "mixamorig:LeftShoulder", "mixamorig:LeftArm", "mixamorig:LeftForeArm", "mixamorig:LeftHand",
+        "mixamorig:RightShoulder", "mixamorig:RightArm", "mixamorig:RightForeArm", "mixamorig:RightHand",
+        "mixamorig:LeftUpLeg", "mixamorig:LeftLeg", "mixamorig:LeftFoot",
+        "mixamorig:RightUpLeg", "mixamorig:RightLeg", "mixamorig:RightFoot",
+    ]
+    parents = [-1, 0, 1, 2, 3, 2, 5, 6, 7, 2, 9, 10, 11, 0, 13, 14, 0, 16, 17]
+    heads = [
+        (0, 0, 1), (0, 0, 1.2), (0, 0, 1.4), (0, 0, 1.6), (0, 0, 1.75),
+        (.1, 0, 1.5), (.2, 0, 1.5), (.45, 0, 1.5), (.7, 0, 1.5),
+        (-.1, 0, 1.5), (-.2, 0, 1.5), (-.45, 0, 1.5), (-.7, 0, 1.5),
+        (.1, 0, .95), (.1, 0, .5), (.1, 0, .08),
+        (-.1, 0, .95), (-.1, 0, .5), (-.1, 0, .08),
+    ]
+    matrices = []
+    for head in heads:
+        matrix = np.eye(4)
+        matrix[:3, 3] = head
+        matrices.append(matrix.tolist())
+    return {
+        "forward": "-Y", "joint_names": names, "bone_names": names,
+        "parents": parents, "heads": heads, "rest_matrices": matrices,
+        "signature": "clavicle-fixture-signature",
+    }
+
+
 def manifest():
     bindings = [
         ("pelvis", "Hips"), ("spine", "Spine"), ("chest", "Spine2"),
@@ -89,7 +118,7 @@ def manifest():
             {"id": "lower", "frame": 30,
              "localEulerDeg": {"hip_left": [-45, 0, 0], "hip_right": [-45, 0, 0],
                                "knee_left": [70, 0, 0], "knee_right": [70, 0, 0]},
-             "root": {"positionMeters": [0, 0, 0], "rotationDeg": [0, 0, 0], "yawDeg": 0},
+             "root": {"positionMeters": [0, -.17, 0], "rotationDeg": [0, 0, 0], "yawDeg": 0},
              "constraints": empty},
             {"id": "reach", "frame": 60,
              "localEulerDeg": {"shoulder_left": [-45, 0, 30], "elbow_left": [-30, 0, 0]},
@@ -121,6 +150,44 @@ class PosecodeBridgeTests(unittest.TestCase):
         # The +90 degree semantic shoulder Z rotation raises the left forearm
         # in the selected rig instead of applying Mixamo's raw local axes.
         self.assertGreater(positions[0, 6, 2], positions[0, 5, 2])
+
+        lower = np.asarray(references[1]["pose"]["features"])
+        lower_positions, _ = motion.decode_features(lower[None], motion.canonicalize(skeleton()))
+        self.assertAlmostEqual(lower_positions[0, 13, 2], HEADS[13][2], delta=.005)
+        self.assertAlmostEqual(lower_positions[0, 16, 2], HEADS[16][2], delta=.005)
+
+    def test_shares_swing_with_clavicle_without_changing_upper_arm_world_rotation(self):
+        data = manifest()
+        keyframe = data["keyframes"][-1]
+        base = skeleton()
+        shared = skeleton_with_clavicles()
+
+        base_pose = posecode.encode_keyframe(
+            keyframe, base, posecode._match_bones(data["rig"]["boneBindings"], base)
+        )
+        shared_pose = posecode.encode_keyframe(
+            keyframe, shared, posecode._match_bones(data["rig"]["boneBindings"], shared)
+        )
+        _, base_rotations = motion.decode_features(
+            np.asarray(base_pose["features"])[None], motion.canonicalize(base)
+        )
+        _, shared_rotations = motion.decode_features(
+            np.asarray(shared_pose["features"])[None], motion.canonicalize(shared)
+        )
+
+        base_arm = base["bone_names"].index("mixamorig:LeftArm")
+        shared_arm = shared["bone_names"].index("mixamorig:LeftArm")
+        clavicle = shared["bone_names"].index("mixamorig:LeftShoulder")
+        chest = shared["bone_names"].index("mixamorig:Spine2")
+        np.testing.assert_allclose(
+            shared_rotations[0, shared_arm], base_rotations[0, base_arm], atol=1e-7
+        )
+        clavicle_delta = shared_rotations[0, chest].T @ shared_rotations[0, clavicle]
+        clavicle_angle = math.acos(
+            np.clip((np.trace(clavicle_delta) - 1) / 2, -1.0, 1.0)
+        )
+        self.assertGreater(clavicle_angle, math.radians(1))
+        self.assertLessEqual(clavicle_angle, posecode.CLAVICLE_MAX_UP + 1e-7)
 
     def test_rejects_unknown_reference(self):
         data = manifest()

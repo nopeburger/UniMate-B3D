@@ -96,6 +96,13 @@ class UNIMATE_OT_import_posecode(bpy.types.Operator, ImportHelper):
     bl_options = {"REGISTER", "UNDO"}
     filename_ext = ".json"
     filter_glob: StringProperty(default="*.json", options={"HIDDEN"})
+    overwrite_confirmed: BoolProperty(default=False, options={"HIDDEN", "SKIP_SAVE"})
+
+    def draw(self, context):
+        if self.overwrite_confirmed:
+            count = len(context.scene.unimate_motion.clips)
+            self.layout.label(text=f"Replace the existing timeline with {count} clip{'s' if count != 1 else ''}?")
+
     def execute(self, context):
         from . import selected_rig
         settings = context.scene.unimate_motion
@@ -103,7 +110,7 @@ class UNIMATE_OT_import_posecode(bpy.types.Operator, ImportHelper):
             if settings.family != "mixamo":
                 raise ValueError("Posecode manifests currently require Character: Human.")
             rig = selected_rig(context)
-            skeleton = export_skeleton(rig, settings.forward, settings.tips)
+            skeleton = export_skeleton(rig, settings.forward, settings.tips, settings.fingers)
             manifest = load_posecode_manifest(self.filepath)
             schedule = build_posecode_schedule(manifest, skeleton)
             validate_clips(schedule, skeleton["signature"])
@@ -112,6 +119,14 @@ class UNIMATE_OT_import_posecode(bpy.types.Operator, ImportHelper):
             if abs(scene_fps - manifest_fps) > .001:
                 raise ValueError(
                     f"Set the Blender scene to {manifest_fps} FPS before importing this Posecode manifest."
+                )
+            if settings.clips and not self.overwrite_confirmed:
+                self.overwrite_confirmed = True
+                return context.window_manager.invoke_props_dialog(
+                    self,
+                    width=420,
+                    title="Replace Prompt Timeline?",
+                    confirm_text="Replace Timeline",
                 )
             settings.clips.clear()
             for source in schedule:
