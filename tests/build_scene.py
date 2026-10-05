@@ -191,6 +191,76 @@ def build_creatures(spacing=6.0):
             name, builder(), (index*spacing + 6, 8, 0), material(name + " Mat", color), collection)
     return rigs
 
+def robot_arm_bones():
+    """A six-link industrial arm bolted to the floor with a two-finger gripper. No limbs on the ground."""
+    return [
+        ("base", (0,0,0), (0,0,.15), None, .22),
+        ("turret", (0,0,.15), (0,0,.35), "base", .14),
+        ("shoulder", (0,0,.35), (0,-.05,.75), "turret", .10),
+        ("elbow", (0,-.05,.75), (0,-.45,1.0), "shoulder", .08),
+        ("wrist", (0,-.45,1.0), (0,-.62,.98), "elbow", .06),
+        ("finger_a", (0,-.62,.98), (.05,-.78,.96), "wrist", .02),
+        ("finger_b", (0,-.62,.98), (-.05,-.78,.96), "wrist", .02),
+    ]
+
+def quad_robot_bones():
+    """A four-legged robot: body, head sensor and legs of hip, upper, lower and tip links."""
+    bones = [("body", (0,.3,.5), (0,-.3,.5), None, (.16,.12)),
+             ("sensor", (0,-.3,.5), (0,-.45,.55), "body", .06)]
+    for y, tag in ((-.25, "f"), (.25, "h")):
+        for s, side in ((1, "l"), (-1, "r")):
+            bones += [
+                ("hip_"+tag+side, (s*.16,y,.5), (s*.24,y,.5), "body", .05),
+                ("upper_"+tag+side, (s*.24,y,.5), (s*.26,y+.05,.27), "hip_"+tag+side, .045),
+                ("lower_"+tag+side, (s*.26,y+.05,.27), (s*.26,y-.05,.06), "upper_"+tag+side, .035),
+                ("tip_"+tag+side, (s*.26,y-.05,.06), (s*.26,y-.07,.02), "lower_"+tag+side, .04),
+            ]
+    return bones
+
+def wheeled_robot_bones():
+    """A tracked robot like WALL-E: body, neck and head, two arms and two tracks on the ground."""
+    bones = [("body", (0,0,.3), (0,0,.55), None, (.28,.22)),
+             ("neck", (0,-.05,.55), (0,-.12,.75), "body", .04),
+             ("head", (0,-.12,.75), (0,-.22,.85), "neck", (.18,.1))]
+    for s, side in ((1, "left"), (-1, "right")):
+        bones += [
+            ("track."+side, (s*.30,.25,.12), (s*.30,-.25,.12), "body", (.09,.12)),
+            ("arm_upper."+side, (s*.28,0,.45), (s*.38,-.2,.35), "body", .04),
+            ("arm_lower."+side, (s*.38,-.2,.35), (s*.4,-.42,.4), "arm_upper."+side, .035),
+            ("hand."+side, (s*.4,-.42,.4), (s*.4,-.52,.4), "arm_lower."+side, .04),
+        ]
+    return bones
+
+def plant_bones():
+    """A rooted plant: a stem of four links, a two-jaw head and two leaves."""
+    bones = [("stem1", (0,0,0), (0,0,.3), None, .05),
+             ("stem2", (0,0,.3), (0,0,.6), "stem1", .045),
+             ("stem3", (0,0,.6), (0,-.05,.9), "stem2", .04),
+             ("stalk", (0,-.05,.9), (0,-.1,1.1), "stem3", .035),
+             ("jaw_upper", (0,-.1,1.1), (0,-.32,1.22), "stalk", (.13,.03)),
+             ("jaw_lower", (0,-.1,1.1), (0,-.32,.98), "stalk", (.13,.03))]
+    for s, side in ((1, "left"), (-1, "right")):
+        bones += [("leaf."+side, (s*.03,0,.3), (s*.4,0,.38), "stem1", (.08,.01)),
+                  ("leaf_tip."+side, (s*.4,0,.38), (s*.7,0,.3), "leaf."+side, (.07,.008))]
+    return bones
+
+OBJECT_RIGS = (("UniMate Robot Arm", robot_arm_bones, (.55,.58,.65)),
+               ("UniMate Quad Robot", quad_robot_bones, (.9,.75,.15)),
+               ("UniMate Wheeled Robot", wheeled_robot_bones, (.6,.38,.2)),
+               ("UniMate Plant", plant_bones, (.2,.6,.25)))
+
+def build_objects(spacing=5.0):
+    """Create the robot and plant test rigs in a row along +X, behind the creature row."""
+    collection = bpy.data.collections.get("UniMate Test Rigs")
+    if not collection:
+        collection = bpy.data.collections.new("UniMate Test Rigs")
+        bpy.context.scene.collection.children.link(collection)
+    rigs = {}
+    for index, (name, builder, color) in enumerate(OBJECT_RIGS):
+        key = "_".join(name.split()[1:]).lower()
+        rigs[key] = make_rig(name, builder(), (index*spacing + 6, 16, 0), material(name + " Mat", color), collection)
+    return rigs
+
 def make_rig(name, bones, location, mat, collection):
     existing = bpy.data.objects.get(name)
     if existing:

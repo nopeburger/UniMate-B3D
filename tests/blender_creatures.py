@@ -9,11 +9,12 @@ sys.path[:0] = [str(ROOT / "addon"), str(ROOT / "tests")]
 import unimate_motion
 from unimate_motion.rig import export_skeleton, export_ground, apply_result, contact_names, detect_contact_bones, select_bones
 from unimate_motion.motion import canonicalize, decode_features
-from build_scene import build, build_creatures
+from build_scene import build, build_creatures, build_objects
 
 unimate_motion.register()
 human, creature = build()
 rigs = build_creatures()
+objects = build_objects()
 settings = bpy.context.scene.unimate_motion
 out = ROOT / "tests" / "artifacts"
 out.mkdir(parents=True, exist_ok=True)
@@ -89,6 +90,21 @@ try:
 except RuntimeError as exc:
     assert "Select bones" in str(exc), exc
 
+# Robots and plants: a quadruped robot's legs need detecting, an arm, a tracked robot and a plant have none.
+assert {n: len(contacts(r)) for n, r in objects.items()} == dict(robot_arm=0, quad_robot=0, wheeled_robot=0, plant=0)
+for name, rig in objects.items():
+    skeleton = export_skeleton(rig, "-Y", True)
+    assert 5 <= len(skeleton["parents"]) <= 71, (name, len(skeleton["parents"]))
+    counts[name] = len(skeleton["parents"])
+    found = detect_contact_bones(rig, "-Y")
+    assert (sorted(found) == ["tip_fl", "tip_fr", "tip_hl", "tip_hr"]) == (name == "quad_robot"), (name, found)
+    operate(rig, "DETECT")
+assert len(contacts(objects["quad_robot"])) == 4
+message = check(objects["robot_arm"], family="objaverse")
+assert "0 contact bones" in message and "ground contact cleanup is skipped" in message, message
+assert "4 contact bones" in check(objects["quad_robot"], family="objaverse")
+assert "not a biped" not in check(objects["quad_robot"], family="objaverse")
+
 # Check Rig says how many contact bones it found and warns when cleanup would be skipped.
 message = check(rigs["spider"])
 assert "8 contact bones" in message and "No contact" not in message, message
@@ -101,7 +117,7 @@ assert "not a biped" in message, message
 assert "not a biped" not in check(human, family="mixamo")
 
 # A rest pose decodes and applies onto every rig, whatever its bone rolls.
-for name, rig in list(rigs.items()) + [("human", human), ("creature", creature)]:
+for name, rig in list(rigs.items()) + list(objects.items()) + [("human", human), ("creature", creature)]:
     skeleton = export_skeleton(rig, "-Y", True)
     canon = canonicalize(skeleton)
     features = np.zeros((3, len(skeleton["parents"]), 12))
@@ -122,7 +138,7 @@ for name, rig in list(rigs.items()) + [("human", human), ("creature", creature)]
 
 report = dict(passed=["joint counts", "thin-side capsules for wings", "contact bones by name", "contact detection",
                       "steep tip tilt limits", "mark, unmark and clear", "Check Rig contact messages",
-                      "rest pose round trip"], joints=counts)
+                      "robots and plants", "rest pose round trip"], joints=counts)
 (out / "creatures-blender.json").write_text(json.dumps(report, indent=2))
 print("CREATURES_BLENDER_PASSED", json.dumps(report))
 unimate_motion.unregister()
