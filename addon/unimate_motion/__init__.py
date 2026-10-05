@@ -14,7 +14,7 @@ import uuid
 import bpy
 from bpy.app.handlers import persistent
 from bpy.props import StringProperty, IntProperty, FloatProperty, EnumProperty, BoolProperty, PointerProperty, CollectionProperty
-from .rig import armature_for, export_skeleton, export_ground, apply_result
+from .rig import armature_for, export_skeleton, export_ground, apply_result, contact_names, detect_contact_bones, selected_bones
 from . import clips
 
 _job = None
@@ -57,10 +57,15 @@ class UniMateSettings(bpy.types.PropertyGroup):
     experiment: StringProperty(name="Model folder", subtype="DIR_PATH", default="")
     human_model: BoolProperty(name="Mixamo model for humans", default=True,
         description="For Human characters, use the Mixamo-only checkpoint (unimate_mixamo_f60, installed beside the model folder) when the rig fits its 22-joint limit")
-    prompt: StringProperty(name="Motion", default="A human walks forward at a steady pace.")
+    prompt: StringProperty(name="Motion", default="A human walks forward at a steady pace.",
+        description="Describe one action and name what is doing it, in the plain style of the project's examples: 'A dragon flaps its wings.', 'A spider walks forward.', 'A bird flaps its wings and takes off.'")
     forward: EnumProperty(name="Rig faces", items=[("-Y", "-Y", ""), ("Y", "+Y", ""), ("X", "+X", ""), ("-X", "-X", "")], default="-Y",
         description="World direction the character faces in its rest pose; the armature object's rotation is taken into account")
-    family: EnumProperty(name="Character", items=[("mixamo", "Human", ""), ("truebones", "Animal / Creature", ""), ("objaverse", "Other articulated model", "")])
+    family: EnumProperty(name="Character", items=[
+        ("mixamo", "Human", "People and humanoid characters; uses the human statistics and, for rigs up to 22 joints, the Mixamo model"),
+        ("truebones", "Animal / Creature", "Animals, birds, insects, spiders, crabs, dragons and other creatures with legs, wings or tails"),
+        ("objaverse", "Other articulated model", "Robots, plants, machines and anything that is not a person or an animal")])
+    contact_summary: StringProperty(default="")
     tips: BoolProperty(name="Animate terminal bones", default=True, description="Add virtual endpoint joints; these count toward the model joint limit")
     fingers: BoolProperty(name="Animate finger bones", default=True,
         description="Include finger and thumb bones. Turn off for rigs with full hands (such as Mixamo); fingers then keep their rest pose")
@@ -244,6 +249,62 @@ def choose_model(settings, joints):
     advice = f"; turn off {' or '.join(options)} to use it" if options else ""
     return general, "general model", f"The Mixamo model allows {limits[1]} joints{advice}"
 
+def contact_summary(names):
+    shown = ", ".join(names[:3]) + (f" and {len(names) - 3} more" if len(names) > 3 else "")
+    return f"{len(names)}: {shown}" if names else "none"
+
+class UNIMATE_OT_contact(bpy.types.Operator):
+    bl_idname = "unimate.contact"
+    bl_label = "Contact Bones"
+    bl_options = {"REGISTER", "UNDO"}
+    action: EnumProperty(items=[
+        ("DETECT", "Detect", "Mark limb tips near the ground (legs, claws, tarsi) as contact bones"),
+        ("MARK", "Mark Selected", "Treat the selected bones as ground contacts"),
+        ("UNMARK", "Unmark Selected", "Never treat the selected bones as ground contacts, even if named foot or paw"),
+        ("CLEAR", "Clear Marks", "Remove every contact mark and go back to detecting feet and paws by name")])
+    @classmethod
+    def description(cls, context, properties):
+        return {"DETECT": "Mark limb tips near the ground that are not named foot or paw (spider, crab or dragon legs) as contact bones",
+                "MARK": "Treat the selected bones as ground contacts",
+                "UNMARK": "Never treat the selected bones as ground contacts, even if named foot or paw",
+                "CLEAR": "Remove every contact mark and go back to detecting feet and paws by name"}[properties.action]
+    @classmethod
+    def poll(cls, context):
+        return selected_rig(context) is not None
+    def execute(self, context):
+        settings = context.scene.unimate_motion
+        try:
+            rig = selected_rig(context)
+            bones = rig.data.bones
+            if self.action == "DETECT":
+                names = detect_contact_bones(rig, settings.forward, settings.fingers)
+                for name in names:
+                    bones[name]["unimate_foot"] = 1
+                message = f"Marked {len(names)} contact bone{'' if len(names) == 1 else 's'}" if names else \
+                    "No new contact bones found; mark limb tips by selecting them and using Mark Selected"
+            elif self.action in ("MARK", "UNMARK"):
+                chosen = [bones[n] for n in selected_bones(rig)]
+                if not chosen:
+                    raise ValueError("Select bones in Pose Mode first.")
+                for bone in chosen:
+                    bone["unimate_foot"] = 1 if self.action == "MARK" else 0
+                message = f"{'Marked' if self.action == 'MARK' else 'Unmarked'} {len(chosen)} bone{'' if len(chosen) == 1 else 's'}"
+            else:
+                cleared = 0
+                for bone in bones:
+                    if "unimate_foot" in bone:
+                        del bone["unimate_foot"]
+                        cleared += 1
+                message = f"Cleared {cleared} contact mark{'' if cleared == 1 else 's'}"
+            data = export_skeleton(rig, settings.forward, settings.tips, settings.fingers)
+            settings.contact_summary = contact_summary(contact_names(data))
+            settings.status = f"{message}; contact bones: {settings.contact_summary}"
+            self.report({"INFO"}, settings.status)
+            return {"FINISHED"}
+        except Exception as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
 def joint_hint(settings):
     options = [name for name, on in (("Animate finger bones", settings.fingers),
                                      ("Animate terminal bones", settings.tips)) if on]
@@ -278,7 +339,14 @@ class UNIMATE_OT_validate(bpy.types.Operator):
             if count < 5:
                 raise ValueError("This model requires at least 5 joints.")
             settings.status = f"Rig ready: {len([n for n in data['bone_names'] if n])} bones, {count}/{limit} joints, {label}"
+            contacts = contact_names(data)
+            settings.status += f", {len(contacts)} contact bone{'' if len(contacts) == 1 else 's'}"
+            settings.contact_summary = contact_summary(contacts)
             warnings = [note] if note else []
+            if settings.motion_cleanup and not contacts:
+                warnings.append("No contact bones, so ground contact cleanup is skipped. If this rig has legs, use Detect in the contact bone settings")
+            elif settings.family == "mixamo" and len(contacts) > 2:
+                warnings.append(f"{len(contacts)} contact bones is not a biped; consider Character: Animal / Creature")
             facing = facing_from_feet(data)
             if facing and facing != settings.forward:
                 warnings.append(f"Feet point {facing.replace('Y', '+Y').replace('X', '+X').replace('-+', '-')}; check Rig faces")
@@ -462,6 +530,13 @@ class UNIMATE_PT_main(bpy.types.Panel):
         layout.prop(settings, "advanced", icon="TRIA_DOWN" if settings.advanced else "TRIA_RIGHT", emboss=False)
         if settings.advanced:
             layout.prop(settings, "ground_object")
+            box = layout.box()
+            box.label(text="Contact bones: " + (settings.contact_summary or "run Check Rig"), icon="BONE_DATA")
+            row = box.row(align=True)
+            row.operator("unimate.contact", text="Detect").action = "DETECT"
+            row.operator("unimate.contact", text="Mark").action = "MARK"
+            row.operator("unimate.contact", text="Unmark").action = "UNMARK"
+            row.operator("unimate.contact", text="", icon="X").action = "CLEAR"
             layout.prop(settings, "tips")
             layout.prop(settings, "fingers")
             layout.prop(settings, "settle_to_ground")
@@ -481,7 +556,7 @@ class UNIMATE_PT_main(bpy.types.Panel):
             layout.prop(settings, "job_dir", text="Last job")
         layout.label(text="Experimental • simple deform rigs", icon="INFO")
 
-classes = clips.CLASSES + (UniMateSettings, UNIMATE_OT_validate, UNIMATE_OT_generate, UNIMATE_OT_cancel, UNIMATE_OT_unload, UNIMATE_OT_apply, UNIMATE_PT_main)
+classes = clips.CLASSES + (UniMateSettings, UNIMATE_OT_validate, UNIMATE_OT_contact, UNIMATE_OT_generate, UNIMATE_OT_cancel, UNIMATE_OT_unload, UNIMATE_OT_apply, UNIMATE_PT_main)
 
 def register():
     for cls in classes:
