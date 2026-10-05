@@ -2,13 +2,17 @@
 
 **Local text-to-motion for simple deform-bone rigs in Blender.** This is a fork of [Friedrich-M/UniMate](https://github.com/Friedrich-M/UniMate) that adds a Blender panel, a separate inference backend, prompt timelines, pose references, and an editable Blender Action. Maintained by [@nopeburger](https://github.com/nopeburger).
 
-![Sword swing from the included 180-frame Blender demo](demo/media/sword-swing.gif)
+![A Mixamo character runs, jumps over a cube and kicks a cylinder, generated with UniMate](demo/media/mixamo-run-jump-kick.gif)
 
-| Running | Jumping over a cube | Sword swing |
+| Running | Jumping over a cube | Front kick |
 | :---: | :---: | :---: |
-| ![Running pose](demo/media/running.png) | ![Jump above the obstacle](demo/media/jumping.png) | ![Sword swing pose](demo/media/sword-swing.png) |
+| ![Running pose](demo/media/mixamo-run.png) | ![Jump above the obstacle](demo/media/mixamo-jump.png) | ![Front kick on the cylinder](demo/media/mixamo-kick.png) |
 
-The [demo scene](demo/UniMate_Run_Jump_Sword.blend) contains a human deform rig, sword, obstacle cube, ground plane, and a 180-frame Action. Frames **1–60** run, **61–120** jump over the cube and land, and **121–180** swing the sword. Open it in Blender and press Play; the animation works without the model weights. This Action began with UniMate output, then received a deterministic 1.5-unit forward jump arc and contact/knee cleanup so it clears the visible cube. The GIF shows the sword portion of that Action.
+The animation above is a 210-frame, three-prompt timeline on a [Mixamo](https://www.mixamo.com) character, generated with the **Mixamo model for humans** and seed 21: frames **1–90** *"A human runs forward."*, **91–150** *"A human jumps far forward with both feet and lands."* and **151–210** *"A human does a front kick with the right leg."* The cube and cylinder are placed to match the result; the model does not see scene geometry. The character is Mixamo content and is not distributed here, so only the renders are included. Mixamo characters import with their FBX orientation and the **Animate finger bones** option controls whether the hands are driven.
+
+The repository also includes an older [demo scene](demo/UniMate_Run_Jump_Sword.blend) with a generic human deform rig, sword, obstacle cube, ground plane, and a 180-frame Action (run, jump over the cube, sword swing). Open it in Blender and press Play; the animation works without the model weights. That Action began with UniMate output, then received a deterministic 1.5-unit forward jump arc and contact/knee cleanup so it clears the visible cube.
+
+![Sword swing from the older 180-frame demo scene](demo/media/sword-swing.gif)
 
 ## Requirements
 
