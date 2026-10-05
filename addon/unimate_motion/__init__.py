@@ -34,6 +34,9 @@ class UniMateSettings(bpy.types.PropertyGroup):
     ground_object: PointerProperty(name="Ground mesh", type=bpy.types.Object,
         poll=lambda self, obj: obj.type == "MESH",
         description="Optional static surface for foot and paw contact; otherwise use the rest sole level")
+    edit_existing: BoolProperty(name="Regenerate selected bones", default=False,
+        description="Keep the rig's current animation and regenerate only the bones selected in Pose Mode (and the bones below them) from this prompt. "
+                    "Needs one prompt clip and an Action on the rig; the result is applied as a new Action, and bones you did not select are left exactly as keyed")
     smoothing: FloatProperty(name="Motion smoothing", default=0.0, min=0.0, max=4.0, precision=1,
         description="Smooth the generated motion over time, in frames. Calms jitter and fast head or limb jerks that some non-human rigs get (dragons, long necks) at the cost of some sharpness; 1.5 to 2.5 is a good start. 0 leaves the motion as generated")
     motion_cleanup: BoolProperty(name="Motion cleanup", default=True,
@@ -416,6 +419,8 @@ class UNIMATE_OT_generate(bpy.types.Operator):
                            ground=export_ground(rig, skeleton, settings.ground_object) if settings.motion_cleanup else None)
             if settings.mode == "TIMELINE":
                 request.update(clips.collect_schedule(settings, skeleton, context.scene))
+                if settings.edit_existing:
+                    request["edit"] = clips.collect_edit(settings, rig, skeleton, context.scene, request["clips"])
                 request.update(transition_frames=settings.transition_frames,
                                pose_approach_frames=settings.pose_approach_frames,
                                extend_clips=settings.extend_clips)
@@ -526,6 +531,8 @@ class UNIMATE_PT_main(bpy.types.Panel):
             row.prop(settings, "frames")
             row.prop(settings, "seed")
             layout.prop(settings, "start_frame")
+        if settings.mode == "TIMELINE":
+            clips.draw_edit(layout, context)
         layout.prop(settings, "smoothing")
         layout.prop(settings, "motion_cleanup")
         layout.prop(settings, "fixed_base")

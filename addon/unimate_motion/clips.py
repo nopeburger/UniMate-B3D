@@ -9,8 +9,9 @@ import bpy
 import bpy.utils.previews
 from bpy.props import StringProperty, IntProperty, BoolProperty, CollectionProperty
 from bpy_extras.io_utils import ImportHelper
-from .rig import export_skeleton
-from .poses import ROLES, auto_mapping, capture_pose, preview_estimate
+from .motion import encode_motion
+from .rig import export_skeleton, selected_bones
+from .poses import ROLES, auto_mapping, capture_motion, capture_pose, preview_estimate
 from .posecode import build_schedule as build_posecode_schedule, load_manifest as load_posecode_manifest
 from .schedule import validate_clips
 
@@ -58,6 +59,33 @@ def collect_schedule(settings, skeleton, scene):
         clips.append(dict(prompt=item.prompt, start=item.start, end=item.end, references=refs))
     validate_clips(clips, skeleton["signature"])
     return dict(clips=clips, overlap=settings.overlap, fps=scene.render.fps / scene.render.fps_base)
+
+def collect_edit(settings, rig, skeleton, scene, clip_list):
+    """The existing motion and the bones to regenerate, for a Regenerate Selected Bones request."""
+    if len(clip_list) != 1:
+        raise ValueError("Regenerating bones works on one prompt clip. Remove the others.")
+    if clip_list[0]["references"]:
+        raise ValueError("Remove the pose references from this clip: the kept bones already pin the motion.")
+    if not rig.animation_data or not rig.animation_data.action:
+        raise ValueError("The rig has no Action to keep. Animate it first, or turn off Regenerate selected bones.")
+    names = [n for n in selected_bones(rig) if n in skeleton["bone_names"]]
+    if not names:
+        raise ValueError("Select the bones to regenerate in Pose Mode.")
+    if skeleton["bone_names"][0] in names:
+        raise ValueError("The root bone cannot be regenerated. Deselect it and select the limbs or spine to change.")
+    start, end = clip_list[0]["start"], clip_list[0]["end"]
+    positions, rotations = capture_motion(rig, skeleton, scene, start, end)
+    return dict(regenerate=names, features=encode_motion(positions, rotations, skeleton).tolist(),
+                root_start=positions[0, 0].tolist())
+
+def draw_edit(layout, context):
+    from . import selected_rig
+    s = context.scene.unimate_motion
+    layout.prop(s, "edit_existing")
+    if s.edit_existing:
+        rig = selected_rig(context)
+        count = len(selected_bones(rig)) if rig else 0
+        layout.label(text=f"{count} bone{'' if count == 1 else 's'} selected in Pose Mode", icon="BONE_DATA")
 
 class UNIMATE_UL_clips(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):

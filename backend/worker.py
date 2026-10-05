@@ -130,6 +130,7 @@ def generate(request, output, status):
     from unimate.inference.generate import generate_samples
     from timeline import pin_root
     from timeline import constraints, plan_windows, retime
+    from timeline import edit_mask, edit_window, edit_windows, restore_kept
     if request.get("schema") != 1 or not request["prompt"].strip():
         raise ValueError("A valid request and a non-empty prompt are required.")
     exp = Path(request["experiment"]).resolve()
@@ -172,7 +173,22 @@ def generate(request, output, status):
     overlap = int(request.get("overlap", 10))
     if not 1 <= overlap < shape[-1]-1:
         raise ValueError("Transition context must be smaller than the model window.")
-    if request.get("clips"):
+    edit = request.get("edit")
+    if edit:
+        if len(clips) != 1 or clips[0].get("references"):
+            raise ValueError("Regenerating bones takes one prompt clip without pose references.")
+        needed = clips[0]["end"] - clips[0]["start"] + 1
+        existing = np.asarray(edit["features"], dtype=np.float32)
+        if existing.shape != (needed, len(mean), 12) or not np.isfinite(existing).all():
+            raise ValueError("The existing motion does not match the clip's frames and the rig's joints.")
+        names = request["skeleton"]["bone_names"]
+        unknown = [n for n in edit["regenerate"] if n not in names]
+        if unknown:
+            raise ValueError("Unknown bones to regenerate: " + ", ".join(unknown))
+        keep, regenerated = edit_mask(canonical["parents"], [names.index(n) for n in edit["regenerate"]])
+        normalized = (existing - mean) / std
+        plan = [(0, {})] * edit_windows(needed, shape[-1], overlap)
+    elif request.get("clips"):
         plan = plan_windows(clips, shape[-1], overlap, request.get("extend_clips", True))
     else:
         plan = [(0, {})]
@@ -184,6 +200,16 @@ def generate(request, output, status):
             write_status(status, "running", f"Generating window {index+1}/{len(plan)} "
                          f"(prompt {clip_index+1}/{len(clips)}) on {device}")
             known, mask = constraints(previous, slots, shape, overlap, mean, std, device)
+            if edit:
+                first_slot = 0 if index == 0 else overlap
+                window_known, window_mask = edit_window(normalized, keep, index * (shape[-1] - overlap), shape[-1], first_slot)
+                if known is None:
+                    known = torch.zeros(shape, device=device)
+                    mask = torch.zeros(shape, device=device, dtype=torch.bool)
+                joint_count = len(mean)
+                pinned = torch.as_tensor(window_mask, device=device)
+                known[0, :joint_count] = torch.where(pinned, torch.as_tensor(window_known, device=device), known[0, :joint_count])
+                mask[0, :joint_count] |= pinned
             samples = generate_samples(
                 model, conditions[clip_index], shape, "flow", diffusion, Sampler(diffusion),
                 device=device, cfg_scale=cfg_scale, x1_known=known, keep_mask=mask)
@@ -199,15 +225,23 @@ def generate(request, output, status):
     joints = len(canonical["parents"])
     features = samples[0, :joints].permute(2, 0, 1).cpu().numpy()
     features = features * std[None] + mean[None]
-    if not request.get("clips"):
+    if edit:
+        features = features[:needed]
+    elif not request.get("clips"):
         features = features[:frames]
     positions, rotations = load_geometry().decode_features(features, canonical)
-    if request.get("fixed_base"):
+    if edit:
+        # Decoding starts the root at the origin; the pinned velocities reproduce the authored path from there.
+        authored_positions, authored_rotations = load_geometry().decode_features(existing, canonical)
+        shift = np.asarray(edit["root_start"], dtype=float) - authored_positions[0, 0]
+        authored_positions = authored_positions + shift
+        positions = positions + shift
+    if request.get("fixed_base") and not edit:
         positions, rotations = pin_root(positions, rotations, request["skeleton"])
-    if request.get("smoothing", 0) > 0:
+    if request.get("smoothing", 0) > 0 and not edit:
         from timeline import smooth_motion
         positions, rotations = smooth_motion(positions, rotations, request["skeleton"], float(request["smoothing"]))
-    if request.get("clips"):
+    if request.get("clips") and not edit:
         positions, rotations = retime(positions, rotations, spans, clips, request["skeleton"],
                                      request.get("transition_frames", 12),
                                      request.get("pose_approach_frames", 60), seams)
@@ -220,7 +254,7 @@ def generate(request, output, status):
             positions, rotations, request["skeleton"], request.get("ground"), request.get("settle_to_ground", True),
             request.get("self_collision", "auto"), request.get("plant_feet", "auto"))
         # Captured references stay exact: cleanup may not move them.
-        if request.get("clips"):
+        if request.get("clips") and not edit:
             from timeline import restore_references
             frames, offset = [], 0
             for clip in clips:
@@ -228,6 +262,9 @@ def generate(request, output, status):
                 offset += clip["end"] - clip["start"] + 1
             positions, rotations = restore_references(positions, rotations, source_positions,
                                                       source_rotations, frames, request["skeleton"])
+    if edit:
+        positions, rotations = restore_kept(positions, rotations, authored_positions, authored_rotations,
+                                            regenerated, request["skeleton"])
     temp = output.with_suffix(".tmp")
     with temp.open("wb") as handle:
         np.savez_compressed(handle, schema=1, positions=positions, rotations=rotations,
