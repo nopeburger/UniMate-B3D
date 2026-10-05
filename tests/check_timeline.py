@@ -47,6 +47,14 @@ for j in range(5):
     local[:,j]=Rotation.from_rotvec(np.outer(np.linspace(0,.8,60),[0,j/5,0])).as_matrix()
 root=np.column_stack([np.linspace(0,1,60),np.zeros(60),np.ones(60)])
 sp,sr=forward_kinematics(root,local,synthetic)
+# Fixed base: the root stays at its rest position in every frame, while joint
+# rotations and the shape of the body relative to the root are unchanged.
+from timeline import pin_root
+pinned_p,pinned_r=pin_root(sp,sr,synthetic)
+assert np.allclose(pinned_p[:,0],synthetic["heads"][0],atol=1e-12)
+assert np.allclose(to_local(pinned_r,synthetic["parents"]),to_local(sr,synthetic["parents"]),atol=1e-9)
+assert np.allclose(pinned_p-pinned_p[:,:1],sp-sp[:,:1],atol=1e-9)
+assert np.ptp(sp[:,0,0])>.5 and np.ptp(pinned_p[:,0],axis=0).max()<1e-12
 testclips=[dict(start=5,end=64,references=[dict(frame=i) for i in [5,25,45]])]
 pp,rr=retime(sp,sr,[(0,60)],testclips,synthetic,12,15)
 for index in [0,20,40,59]:
@@ -147,7 +155,7 @@ _free=dict(_sk2,foot_profiles=[])
 _pu,_ru=smooth_motion(_p2,_r2,_free,3.0)
 _amp=lambda p:np.ptp(p[10:-10,3]-p[10:-10,0],axis=0).max()
 assert _amp(_ps2)>_amp(_pu)*1.5 and _amp(_ps2)>_amp(_p2)*.5
-report=dict(passed=["references restored after edits","window joins smoothed","reference exits smoothed","window planning","chained reference slots","exact reference frame","earlier prompt preserved","no sit rotation spike",
+report=dict(passed=["fixed base pins the root","references restored after edits","window joins smoothed","reference exits smoothed","window planning","chained reference slots","exact reference frame","earlier prompt preserved","no sit rotation spike",
                     "no endpoint root snap","FK bone lengths","disable editing",
                     "multiple and first-frame references","interior reference release",
                     "short and stretched clips","motion smoothing","limbs keep their swing"],

@@ -77,6 +77,7 @@ These controls sit below either workflow:
 | Control | What it does |
 | --- | --- |
 | **Motion cleanup** | Enabled by default. After inference, estimates self-collisions using proxies derived from the rig's weighted meshes, corrects ground contact and penetration, and limits extreme foot or paw tilt and support-limb bend. It is a heuristic pass, not a physics simulation; inspect hands, knees, paws, and ground contact. Disabling it also skips the optional ground mesh. |
+| **Fixed base** | Off by default. Keeps the root bone at its rest position in every frame and animates only rotations. Use it for a plant, a robot arm or a machine fixed to the floor or a wall; without it the model's root travel and bobbing can slide or hop the whole rig (a plant swaying in the wind hopped 33 cm, a robot arm slid 1.2 m). |
 | **Generate Motion** | Validates the rig, model files, and selected workflow, then starts a local backend job. Blender remains interactive. For a timeline, all clip ranges and captured references are checked first. This button becomes **Cancel Generation** while a job is running. |
 | **Cancel Generation** | Stops the currently running generation or pose-estimation process. A later generation starts a new job. |
 | **Apply Motion** | Becomes available after a successful job has written `motion.npz`. It creates a new editable Action on the selected rig. In single-prompt mode it starts at **Start frame**; in timeline mode it starts at the first clip's **Start**. Save the `.blend` file to keep the Action. |

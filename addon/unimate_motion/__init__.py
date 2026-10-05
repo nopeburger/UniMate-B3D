@@ -37,6 +37,8 @@ class UniMateSettings(bpy.types.PropertyGroup):
         description="Smooth the generated motion over time, in frames. Calms jitter and fast head or limb jerks that some non-human rigs get (dragons, long necks) at the cost of some sharpness; 1.5 to 2.5 is a good start. 0 leaves the motion as generated")
     motion_cleanup: BoolProperty(name="Motion cleanup", default=True,
         description="Correct self-collisions, ground contact and extreme foot/paw rotations; intersecting reference poses may be adjusted")
+    fixed_base: BoolProperty(name="Fixed base", default=False,
+        description="Keep the root bone where it is and animate only rotations, for plants, robot arms and machines fixed to the floor or a wall. Otherwise the model's root travel and bobbing slide or hop the whole rig")
     self_collision: EnumProperty(name="Self-collision", default="auto", items=[
         ("auto", "Auto", "Keep limbs from passing through the body; off for rigs with five or more contact bones"),
         ("on", "On", "Always push colliding parts apart"),
@@ -402,7 +404,7 @@ class UNIMATE_OT_generate(bpy.types.Operator):
             request = dict(schema=1, skeleton=skeleton, prompt=settings.prompt.strip(),
                            experiment=str(exp), stats_family=settings.family, frames=settings.frames,
                            fps=settings.fps, seed=settings.seed, guidance=settings.guidance,
-                           motion_cleanup=settings.motion_cleanup, settle_to_ground=settings.settle_to_ground, smoothing=settings.smoothing,
+                           motion_cleanup=settings.motion_cleanup, fixed_base=settings.fixed_base, settle_to_ground=settings.settle_to_ground, smoothing=settings.smoothing,
                            self_collision=settings.self_collision, plant_feet=settings.plant_feet,
                            ground=export_ground(rig, skeleton, settings.ground_object) if settings.motion_cleanup else None)
             if settings.mode == "TIMELINE":
@@ -519,6 +521,7 @@ class UNIMATE_PT_main(bpy.types.Panel):
             layout.prop(settings, "start_frame")
         layout.prop(settings, "smoothing")
         layout.prop(settings, "motion_cleanup")
+        layout.prop(settings, "fixed_base")
         if _job:
             layout.operator("unimate.cancel", icon="CANCEL")
         else:
