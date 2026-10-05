@@ -143,6 +143,11 @@ def solve(positions,rotations,skeleton,iterations=32):
                 if parent>=0:
                     world_change=Rotation.from_rotvec(updates[j]).as_matrix()
                     pose_local[j]=(rot[parent].T@world_change@rot[parent])@pose_local[j]
+            # Each correction multiplies matrices that already carry rounding error,
+            # and a joint's error is applied again through every joint below it, so
+            # along a long chain (a snake) it grows each iteration until the pose
+            # explodes. Keep every local rotation on SO(3).
+            pose_local=Rotation.from_matrix(pose_local).as_matrix()
             p,r=forward_kinematics(positions[t:t+1,0],pose_local[None],skeleton)
             pos,rot=p[0],r[0]
         pa,pb,delta,dist=rig.contacts(pos,rot)

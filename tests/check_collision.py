@@ -32,12 +32,34 @@ for label in ['human','creature']:
   j=skel['bone_names'].index('front_paw.right')
   direction=rot[-1,j]@np.asarray(skel['rest_matrices'][j])[:3,1]
   assert np.degrees(np.arcsin(direction[2]))<45.01
+# A long chain (a snake) folded back on itself: corrections stack up along 40 joints, and rounding
+# error used to grow each iteration until the rotations exploded. They must stay finite and orthonormal.
+count=40
+parents=[-1]+list(range(count-1))
+heads=np.array([[0.,-.08*i,.05] for i in range(count)])
+chain={'parents':parents,'heads':heads.tolist(),'collision_capsules':[
+    {'joint':i,'a':heads[i].tolist(),'b':(heads[i]+[0,-.08,0]).tolist(),'radius':.045} for i in range(count)]}
+chain['rest_matrices']=[np.eye(4).tolist()]*count
+chain['bone_names']=['b%d'%i for i in range(count)]
+chain['labels']=['spine']*count
+rng=np.random.default_rng(1)
+frames=30
+swing=np.zeros((frames,count,3))
+swing[:,1:,2]=.5+.2*np.sin(np.arange(frames)[:,None]*.4+np.arange(1,count)[None]*.3)  # a tight coil whose turns overlap
+swing[:,1:,0]=rng.normal(0,.02,(frames,count-1))
+local=Rotation.from_rotvec(swing.reshape(-1,3)).as_matrix().reshape(frames,count,3,3)
+pos,rot=forward_kinematics(np.zeros((frames,3)),local,chain)
+with np.errstate(all='raise'):
+ p,r,report=solve(pos,rot,chain)
+assert np.isfinite(p).all() and np.isfinite(r).all()
+assert np.allclose(r.swapaxes(-1,-2)@r,np.eye(3),atol=1e-8), np.abs(r.swapaxes(-1,-2)@r-np.eye(3)).max()
+assert report['max_penetration_after']<report['max_penetration_before']
 # Missing meshes must be a documented no-op, not an exception.
 empty={'parents':[-1,0], 'heads':[[0,0,0],[0,0,1]]}
 pos=np.array([empty['heads']],float);rot=np.tile(np.eye(3),(1,2,1,1))
 p,q,report=solve(pos,rot,empty)
 assert np.array_equal(p,pos) and report['method']=='none'
 result={'passed':['segment geometry','sphere capsules','FK invariance','valid rotations',
-                  'self-collision tolerance','temporal continuity','paw tilt and stance contact','no-mesh fallback']}
+                  'self-collision tolerance','temporal continuity','paw tilt and stance contact','no-mesh fallback','long chains stay stable']}
 (ROOT/'tests/artifacts/collision-regressions.json').write_text(json.dumps(result,indent=2))
 print(json.dumps(result))
