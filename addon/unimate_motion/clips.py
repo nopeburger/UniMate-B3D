@@ -27,7 +27,8 @@ class UniMateReference(bpy.types.PropertyGroup):
     estimate_path: StringProperty()
 
 class UniMateClip(bpy.types.PropertyGroup):
-    prompt: StringProperty(name="Prompt", default="A human walks forward.")
+    prompt: StringProperty(name="Prompt", default="A human walks forward.",
+        description="Describe one action and name what is doing it, in the plain style of the project's examples: 'A dragon flaps its wings.', 'A spider walks forward.', 'A bird flaps its wings and takes off.'")
     start: IntProperty(name="Start", default=1)
     end: IntProperty(name="End", default=60)
     references: CollectionProperty(type=UniMateReference)

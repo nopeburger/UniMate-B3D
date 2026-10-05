@@ -17,7 +17,7 @@ Use a simple single-root deform hierarchy. Active pose constraints, drivers, NLA
 
 ## Choose a workflow
 
-**Workflow** switches between **Single prompt** and **Prompt timeline**. Both use the rig, character family, forward axis, cleanup toggle, and advanced setup fields above and below the workflow controls.
+**Workflow** switches between **Single prompt** and **Prompt timeline** (the default). Both use the rig, character family, forward axis, cleanup toggle, and advanced setup fields above and below the workflow controls.
 
 ### Single prompt
 
@@ -42,7 +42,7 @@ Use a timeline when the character should perform multiple described actions. The
 | --- | --- |
 | **+ / − beside the clip list** | Add or remove a prompt clip. A new clip starts immediately after the previous clip and initially spans 60 frames. Removing a clip does not automatically renumber the others; fix the remaining ranges before generation. |
 | **Prompt** | Text for the selected clip. Every clip needs a nonempty description. |
-| **Start / End** | Inclusive Blender frames for the selected clip. Clips must be ordered and contiguous: for example, **1–60**, **61–120**, **121–180**, with no gap or overlap. Each clip must cover **2–600 frames**. The whole sequence can contain at most **32 clips** and **10,000 frames**. The model generates 60-frame windows. With **Generate long clips in full**, a clip gets as many chained windows as its length needs (each later window adds 50 new frames after 10 frames of context), then the result is retimed to the exact span, so a 180-frame clip contains about three windows of motion. |
+| **Start / End** | Inclusive Blender frames for the selected clip. Clips must be ordered and contiguous: for example, **1–60**, **61–120**, **121–180**, with no gap or overlap. Each clip must cover **2–600 frames**. The whole sequence can contain at most **32 clips** and **10,000 frames**. The model generates 60-frame windows. With **Generate long clips in full**, a clip gets as many chained windows as its length needs (with the default **Transition context** of 10, each later window repeats 10 frames as context and adds 50 new ones), then the result is retimed to the exact span, so a 180-frame clip contains about three windows of motion. |
 | **Seed** | Nonnegative seed for the generation job; default **10**. The same seed is used by the timeline request, while the prompts and prior clips affect each window. |
 | **Prompt blend frames** | Smooths the final motion across a clip boundary for **0–120 output frames**; default **12**. Use a larger value if a join snaps, but review short clips because a long blend can soften the intended change. **0** disables this join correction. |
 | **Generate long clips in full** | On by default. Chains extra model windows for clips longer than one window, so long clips gain motion instead of being stretched. Pose references are placed in whichever window covers their frame. Turn it off to stretch a single window over the clip (slower-looking motion, faster generation). |
@@ -66,9 +66,9 @@ References belong to the selected prompt clip. They target **poses at particular
 | **Preview Estimated Pose** | Applies the estimated landmarks to the selected human rig for review. It is disabled until estimation finishes. Preview does not save a reference constraint. |
 | **Human bone mapping** | Expands the mapping from human landmark roles to rig bones. **Auto-map Human Bones** guesses the names; inspect the fields and pick the correct bone for any wrong or missing role before previewing. Mapping is shared at the scene-panel level. |
 | **Capture Current Pose** | Saves the current selected rig pose as the constraint for this reference. For a human, preview the estimate, adjust the rig in Pose Mode, then capture. For a creature, pose the rig manually against the image and capture. You can capture without an image when you want to author the target pose yourself. |
-| **Pose captured / No pose captured yet** | Confirms whether this reference has a saved pose. Every reference must be captured before generation. If the rig's rest skeleton changes, capture again. |
+| **Pose captured / No pose captured yet** | Confirms whether this reference has a saved pose. Every reference must be captured before generation. Capture again if the rig's rest skeleton changes, or after changing **Rig faces**, **Animate terminal bones** or **Animate finger bones**, since those change the exported skeleton. |
 
-The captured target constrains joint rotations and root height at its frame while letting the model generate horizontal movement. A target pose that intersects the character or ground can be adjusted by **Motion cleanup**. If exact captured rotations matter more, turn cleanup off and review collisions yourself. The estimator and preview do not guarantee a physically plausible transition; adjust **Pose approach frames** and inspect the resulting Action.
+The captured target constrains joint rotations, root height and the facing direction at its frame while letting the model generate horizontal movement. Capture the pose facing the way the character should face at that frame; for example, after a clip that turns the character around, a target captured in the rest orientation turns it back. A target pose that intersects the character or ground can be adjusted by **Motion cleanup**. If exact captured rotations matter more, turn cleanup off and review collisions yourself. The estimator and preview do not guarantee a physically plausible transition; adjust **Pose approach frames** and inspect the resulting Action.
 
 ## Generation and cleanup
 
@@ -85,6 +85,22 @@ These controls sit below either workflow:
 
 Each job lives under the configured project's local `outputs/` folder and contains a request, status, log, and result. Those generated files are excluded from Git and are not required to open the included demo scene.
 
+## Creatures, robots and other body plans
+
+The model was trained on bipeds, quadrupeds, birds, insects and spiders, fish and sea creatures, snakes, and articulated objects such as robots, plants and machines. Rigs with many legs, wings, tails or no limbs at all work the same way as a human rig. These settings matter:
+
+| Setting | What to do |
+| --- | --- |
+| **Character** | **Human** for people (and the only choice that can use the Mixamo model). **Animal / Creature** for anything with legs, wings, fins or a tail that is a living thing: dogs, birds, spiders, crabs, dragons, snakes, fish. **Other articulated model** for robots, plants, cameras, arms and other objects. If a Human rig has more than two contact bones, **Check Rig** suggests Animal / Creature. |
+| **Rig faces** | The way the front of the body points (where the eyes look), even for a crab that walks sideways. |
+| **Contact bones** | The limb tips that touch the ground: feet, paws, claws, tarsi. Cleanup uses them to keep legs from sliding or sinking. Bones named *foot* or *paw* are found automatically. For other names (a spider's tarsus, a crab's dactyl, a dragon's claw) click **Detect** in the setup settings: it marks leaf bones that are at least three bones below the root, near the lowest point of the rig and off the body's midline, so tails, raised claws, wings and fins are left alone. Use **Mark** and **Unmark** on selected bones to correct it, and the **X** button to clear all marks. |
+| **Check Rig** | Reports how many contact bones it found. If there are none and **Motion cleanup** is on, ground contact cleanup is skipped and Check Rig says so. Flying, swimming and legless creatures (snakes, fish) and rigs fixed in place (robot arms, plants) have none, which is fine; a quadruped robot's leg tips are found by **Detect**. |
+| **Joint limit** | The general model allows 71 joints. A spider with eight four-bone legs is 45 with terminal bones, a dragon with four legs and two wings about 50. Turn off **Animate terminal bones** if a large rig is over the limit. |
+
+Prompts work best when they name the creature and describe one action, in the plain style of the project's examples: "A dragon flaps its wings.", "A bird flaps its wings and takes off.", "A spider walks forward.", "A seaserpent sways its tail.", "A whale sweeps its tail.", "A quadruped robot walks forward.", "A robot arm pushes forward.", "A plant opens its mouth and bites forward.". For a take-off, a clip of the creature standing first and then a clip of it taking off gives the model a starting pose to leave from.
+
+Cleanup treats wings as part of the body for self-collision and does not know about air or water, so a creature that is meant to fly or swim will not be pushed to the ground; only the contact bones are kept above it.
+
 ## Setup and generation settings
 
 ![Expanded setup and generation settings](images/panel-advanced.png)
@@ -93,17 +109,23 @@ Expand **Setup and generation settings** to configure the backend and less commo
 
 | Control | What it does |
 | --- | --- |
+| **Contact bones** | Shows how many bones count as ground contacts (feet, paws, claws, tarsi) after the last **Check Rig**. **Detect** marks limb tips that are not named foot or paw, **Mark** and **Unmark** change the selected bones, and **X** clears every mark. See [Creatures, wings and other body plans](#creatures-robots-and-other-body-plans). |
 | **Ground mesh** | Optional independent, non-deforming mesh used as a static contact surface when **Motion cleanup** is on. The add-on exports up to **20,000 triangles**. Leave it empty to use the rig's rest-sole level as a fallback plane. A visible ground plane is useful even when no mesh is assigned for cleanup, because it makes contact easier to inspect. |
+| **Settle on ground** | Enabled by default. When the model leaves a walking robot or animal hovering, so that its lowest contact bone never reaches the ground in the whole clip, the motion is lowered until it does. Clips that already touch the ground are not changed. Turn it off for a creature that should fly or hover for the whole clip. It needs contact bones (see **Check Rig**) and **Motion cleanup**. |
+| **Self-collision** and **Plant feet** | **Auto** by default. The two parts of cleanup that push colliding limbs apart and hold planted feet still work well for people and four-legged bodies, but with many legs they rearrange the gait and cross the legs over each other, so Auto leaves rigs with five or more contact bones (spiders, crabs, insects) as the model generated them; the body is still lifted onto the ground. Set them to **On** or **Off** to override. |
 | **Animate terminal bones** | Enabled by default. Adds virtual endpoint joints to the exported skeleton so motion can reach terminal bones. These joints count toward the model's joint limit; turn this off if **Check Rig** reports too many joints. |
 | **Animate finger bones** | Enabled by default. Turn it off to leave finger and thumb bones (and their children) out of the export; they keep their rest pose. Bones are recognized by names such as *thumb*, *index*, *middle*, *ring* and *pinky*. A Mixamo character with fingers exports 52 bones (65 model joints with terminal bones), within the general model's 71. Without fingers it has 22 bones: 27 model joints with terminal bones, or exactly 22, the Mixamo model's skeleton, without them. |
 | **Text guidance** | Classifier-free text guidance scale, **1.01–20**, default **3**. It controls how strongly sampling follows the prompt. Adjust in small steps and compare results with a fixed seed; stronger guidance does not guarantee better anatomy or contact. |
+| **Motion smoothing** | Default **0** (off), up to **4** frames. Smooths the generated joint rotations and root path over time before cleanup. Use about **1.5–2.5** when a non-human rig shows jitter or fast jerks, such as a dragon's head and neck. Contact limbs (feet, shins, thighs) are smoothed only a quarter as much so the gait keeps its swing. It trades some sharpness for calm motion, so fast actions like kicks lose a little snap. |
 | **Motion FPS** | **1–120**, default **30**. Used for single-prompt output timing. In **Prompt timeline**, the request uses the Blender scene's FPS instead. It changes playback interpretation, not the number of generated model frames. |
-| **Transition context** | **1–30** model frames, default **10**. During timeline generation, the tail of the prior model window is supplied as known context to the next prompt. It may improve continuity at the source-motion level. For the visible final join, tune **Prompt blend frames**. This field has no effect on a single prompt. |
+| **Transition context** | **1–30** model frames, default **10**. During timeline generation, the tail of the prior model window is supplied as known context to the next prompt. It may improve continuity at the source-motion level. It also sets how many frames each chained window repeats, so larger values leave fewer new frames per window (60 minus this value) and need more windows for a long clip. For the visible final join, tune **Prompt blend frames**. This field has no effect on a single prompt. |
 | **Keep model loaded** | On by default. Keeps the backend process and model in memory after a generation, so the next one skips loading. It uses GPU memory while loaded. **Cancel Generation** stops it, and the next run loads again. |
 | **Unload after (minutes)** | **1–240**, default **15**. Stops the loaded backend after this long without a generation. The **X** button beside it unloads immediately. |
 | **Project folder** | Root of the configured local UniMate-B3D clone. It must contain the backend worker and `.venv` Python environment produced by setup. Set this before generation or human pose estimation. |
 | **Model folder** | Folder with the UniMate checkpoint, `config.json`, and `dataset_stats.npy`; with the provided setup, choose `models/unimate_uniml3d_f60_v2` inside the clone. The model's joint limit comes from its config. |
 | **Mixamo model for humans** | On by default. For **Character: Human**, uses the Mixamo-only checkpoint (`models/unimate_mixamo_f60`, downloaded by setup beside the general model) when the rig has at most 22 model joints, its training skeleton. It produces clearly more natural human motion than the general model. Larger rigs, other characters, or a missing download use the **Model folder** model. **Check Rig** names the model it will use and which options to turn off to reach the Mixamo model. |
 | **Last job** | Path of the most recent local job. The add-on fills it after starting generation. **Apply Motion** reads its request and `motion.npz`; you can point it at a previous complete job to apply that result again, provided the rig and timeline timing still match. |
+
+For non-human rigs the model often follows the prompt weakly. Slithering, swimming and in-place spins usually need **Text guidance** around **5–7**; compare with a fixed seed.
 
 The final **Experimental · simple deform rigs** line is a scope reminder, not a setting. The panel does not offer obstacle-aware path planning or a guarantee of collision-free output. For a jump over a specific cube, review and edit the resulting Action against the scene; the [included demo](../demo/UniMate_Run_Jump_Sword.blend) shows such an edited action.

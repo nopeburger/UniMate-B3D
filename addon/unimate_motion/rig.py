@@ -97,7 +97,9 @@ def foot_profiles(rig, skeleton):
             continue
         bone = rig.data.bones[name]
         label = semantic_name(bone.get("unimate_label", name)).split()
-        if not ({"foot", "paw"} & set(label) or bone.get("unimate_foot", False)):
+        # An explicit mark wins over the name: 1 marks a contact bone, 0 excludes a named one.
+        mark = bone.get("unimate_foot")
+        if not (bool(mark) if mark is not None else bool({"foot", "paw"} & set(label))):
             continue
         parent = skeleton["parents"][j]
         upper = skeleton["parents"][parent]
@@ -105,7 +107,10 @@ def foot_profiles(rig, skeleton):
             continue
         rest_direction = np.asarray(skeleton["rest_matrices"][j])[:3, 1]
         pitch = float(np.degrees(np.arctan2(rest_direction[2], np.linalg.norm(rest_direction[:2]))))
-        stance = float(bone.get("unimate_stance_tilt_deg", np.clip(abs(pitch)+15, 20, 45)))
+        # Feet lie nearly flat; limb tips such as spider tarsi point down and need wide limits.
+        steep = abs(pitch) > 35
+        stance = float(bone.get("unimate_stance_tilt_deg",
+                                np.clip(abs(pitch)+(20 if steep else 15), 20, 110 if steep else 45)))
         swing = float(bone.get("unimate_swing_tilt_deg", max(stance+15, 45)))
         if not 10 <= stance <= 120 or not stance <= swing <= 150:
             raise ValueError(f"{name}: foot tilt limits must be 10–150 degrees, with swing >= stance.")
@@ -114,6 +119,61 @@ def foot_profiles(rig, skeleton):
         profiles.append(dict(joint=j, parent=parent, upper=upper, leg_length=leg,
                              stance_tilt=stance, swing_tilt=swing))
     return profiles
+
+
+def _selection_owner(rig):
+    """Where this Blender stores bone selection: pose bones from 5.0, bones before."""
+    pose = rig.pose.bones
+    return pose if len(pose) and "select" in pose[0].bl_rna.properties else rig.data.bones
+
+def selected_bones(rig):
+    """Names of the selected bones of an armature."""
+    return [b.name for b in _selection_owner(rig) if b.select]
+
+def select_bones(rig, names):
+    """Select exactly these bones."""
+    for b in _selection_owner(rig):
+        b.select = b.name in names
+
+def contact_names(skeleton):
+    """Names of the bones the export treats as ground contacts (feet, paws, claws, tarsi)."""
+    return [skeleton["bone_names"][p["joint"]] for p in skeleton["foot_profiles"]]
+
+
+def detect_contact_bones(rig, forward="-Y", fingers=True, reach=.12, midline=.04):
+    """Find limb tips that should count as ground contacts but are not named foot or paw.
+
+    A candidate is a leaf bone at least three bones below the root whose far
+    end is within `reach` x body height of the lowest point of the rig and off
+    the midline, so a tail, a snake body or a fish fin is not mistaken for a
+    leg. Limbs that already have a contact bone are left alone.
+    """
+    skeleton = export_skeleton(rig, forward, tips=False, fingers=fingers)
+    linear, _ = export_frame(rig)
+    names, parents = skeleton["bone_names"], skeleton["parents"]
+    heads = np.asarray(skeleton["heads"])
+    tails = np.array([linear @ np.asarray(rig.data.bones[n].tail_local) for n in names])
+    both = np.vstack([heads, tails])
+    low, height = both[:, 2].min(), max(np.ptp(both[:, 2]), 1e-6)
+    lateral = 1 if forward in ("X", "-X") else 0  # the horizontal axis across the body
+    existing = {p["joint"] for p in skeleton["foot_profiles"]}
+    inner = {p for p in parents if p >= 0}
+    found = []
+    for j in range(len(names)):
+        if j in inner or j in existing:
+            continue
+        ancestors, k = [], parents[j]
+        while k >= 0:
+            ancestors.append(k)
+            k = parents[k]
+        if len(ancestors) < 3 or existing & set(ancestors[:3]):
+            continue
+        if tails[j][2] - low > reach * height:
+            continue
+        if abs(tails[j][lateral] - heads[0][lateral]) < midline * height:
+            continue
+        found.append(names[j])
+    return found
 
 
 def export_ground(rig, skeleton, ground_object=None):
