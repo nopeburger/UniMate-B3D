@@ -43,7 +43,8 @@ class UniMateSettings(bpy.types.PropertyGroup):
     experiment: StringProperty(name="Model folder", subtype="DIR_PATH", default="")
     human_model: BoolProperty(name="Mixamo model for humans", default=True,
         description="For Human characters, use the Mixamo-only checkpoint (unimate_mixamo_f60, installed beside the model folder) when the rig fits its 22-joint limit")
-    prompt: StringProperty(name="Motion", default="A human walks forward at a steady pace.")
+    prompt: StringProperty(name="Motion", default="A human walks forward at a steady pace.",
+        description="Describe one action and name what is doing it, in the plain style of the project's examples: 'A dragon flaps its wings.', 'A spider walks forward.', 'A bird flaps its wings and takes off.'")
     forward: EnumProperty(name="Rig faces", items=[("-Y", "-Y", ""), ("Y", "+Y", ""), ("X", "+X", ""), ("-X", "-X", "")], default="-Y",
         description="World direction the character faces in its rest pose; the armature object's rotation is taken into account")
     family: EnumProperty(name="Character", items=[
