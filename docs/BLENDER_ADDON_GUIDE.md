@@ -130,6 +130,12 @@ For non-human rigs the model often follows the prompt weakly. Slithering, swimmi
 
 The final **Experimental · simple deform rigs** line is a scope reminder, not a setting. The panel does not offer obstacle-aware path planning or a guarantee of collision-free output. For a jump over a specific cube, review and edit the resulting Action against the scene; the [included demo](../demo/UniMate_Run_Jump_Sword.blend) shows such an edited action.
 
+### Optional: the v3 preview checkpoint
+
+Upstream released a preview of its next general checkpoint, `unimate_uniml3d_f60_v3_preview` (100k of a planned 150k training steps, same CC BY-NC 4.0 weights license), in the [UniMate Hugging Face repository](https://huggingface.co/Linzhan/UniMate). The add-on can use it: download its `config.json`, `dataset_stats.npy` and `checkpoints/checkpoint_step_100000.pt` (about 1.2 GB) into `models/unimate_uniml3d_f60_v3_preview` and set **Model folder** to that folder. **Mixamo model for humans** still applies to human rigs.
+
+The v3 preview was trained on re-processed captions, so write prompts the way they read: start with "An object" and describe only the motion ("An object walks forward.", "An object flaps its wings.", not "A dragon walks forward."). In side-by-side tests with the same seeds it was clearly calmer and more natural for four-legged and winged bodies: a dragon's walk was several times smoother with a steady head, its take-off actually left the ground, and a spider held a natural low stance. It also moved less overall: many-legged walks covered little ground, a snake stayed nearly straight, a fish tumbled instead of swimming, and a human crawl began from standing. v2 remains the recommended default; try v3 for legged animals and winged creatures and compare with a fixed seed.
+
 ## Example: run, jump and kick
 
 ![A Mixamo character runs, jumps and kicks, generated as one three-prompt timeline](../demo/media/mixamo-run-jump-kick.gif)
