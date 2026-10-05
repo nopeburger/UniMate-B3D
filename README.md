@@ -12,9 +12,9 @@ The [demo scene](demo/UniMate_Run_Jump_Sword.blend) contains a human deform rig,
 
 ## Requirements
 
-- Blender **4.2 or newer** (developed and checked with Blender 5.1).
+- Blender **4.2 or newer**. The regression tests pass on Blender 4.2, 5.1 and 5.2.
 - Windows, standard **Python 3.10**, and an NVIDIA GPU compatible with the bundled CUDA 12.4 PyTorch requirements for the provided setup script. Other platforms need their own PyTorch installation and setup adjustments.
-- Several GB of free space for Python dependencies, the UniMate checkpoint, and the text encoder. Model weights are downloaded during setup; they are not in this repository or the add-on ZIP.
+- Several GB of free space: the Python dependencies (mostly PyTorch), the two UniMate checkpoints and the pose model (about 2 GB, downloaded by setup), and the text encoder (about 1 GB, downloaded on the first generation). Model weights are not in this repository or the add-on ZIP.
 
 Inference runs in a separate Python environment. Blender's Python does not need PyTorch.
 
@@ -42,17 +42,19 @@ The [Blender add-on panel guide](docs/BLENDER_ADDON_GUIDE.md) explains every con
 3. Optionally assign a static **Ground mesh** in the advanced settings. **Motion cleanup** is enabled by default and estimates self-collisions, ground penetration, stance, foot/paw tilt, and support-limb bend from the rig's weighted meshes.
 4. Click **Generate Motion**. Blender remains interactive while the local backend runs. When the status reports that motion is ready, click **Apply Motion**. This creates a new Action; save your `.blend` file.
 
-The first generation also fetches the text encoder into the local cache. With **Keep model loaded** (on by default), the backend stays running between generations so later runs skip model loading; it unloads after 15 idle minutes, with **Unload Model**, when another file is opened, or when Blender closes. Each job writes its request, status, log, and result under the local `outputs/` directory. These files are excluded from Git.
+The first generation also fetches the text encoder into the local cache. With **Keep model loaded** (on by default), the backend stays running between generations so later runs skip model loading; it unloads after 15 idle minutes, with **Unload Model** or **Cancel Generation**, when another file is opened, or when Blender closes. Each job writes its request, status, log, and result under the local `outputs/` directory. These files are excluded from Git.
 
 ### Pose references
 
-Each prompt clip can contain one or more reference images assigned to target frames. For a **human**, choose the image, click **Estimate Human Pose**, review or change the human bone mapping, click **Preview Estimated Pose**, adjust the rig if needed, and click **Capture Current Pose**. For a **creature**, use the image as a guide to pose the rig manually, then capture it. The captured pose is the actual constraint; selecting an image alone does not impose a pose. Uncaptured references stop generation with an error.
+Each prompt clip can contain one or more reference images assigned to target frames. For a **human**, choose the image, click **Estimate Human Pose**, review or change the human bone mapping, click **Preview Estimated Pose**, adjust the rig if needed, and click **Capture Current Pose**. For a **creature**, use the image as a guide to pose the rig manually, then capture it. The captured pose is the actual constraint; selecting an image alone does not impose a pose. It fixes the joint rotations, root height and facing direction at its frame, while the model still generates the horizontal travel. Uncaptured references stop generation with an error.
 
 **Prompt blend frames** smooth joins between clips. **Pose approach frames** ease into a captured reference within its clip. Both controls can be set to zero. Cleanup may adjust an intersecting captured pose; turn it off when exact reference rotations matter more. Single-image human pose estimation cannot reliably infer hidden limbs, depth, or ground contact, so review every estimate.
 
 ## Scope and limits
 
 This is an experimental adapter for **simple deform-bone human and creature rigs**, including multi-legged, winged, serpentine and marine bodies and robots (see [Creatures, robots and other body plans](docs/BLENDER_ADDON_GUIDE.md#creatures-robots-and-other-body-plans)). Active pose constraints, drivers, NLA tracks, and control rigs are not supported directly. Deform bones without any skin weights (such as Mixamo's `_End` helper bones) are left out of the export. The downloaded v2 checkpoint permits at most **71 model joints**, counting virtual terminal joints. The armature object needs a uniform, positive scale. Motion cleanup uses capsule proxies derived from skin weights and heuristic foot contact; it is not a physics simulation and cannot guarantee collision-free output on every mesh. Contact uncertainty is reported in job results. Creature pose images are manually matched in this version.
+
+The models know some actions much better than others. The Mixamo model handles upright human motion (walking, running, jumping, turning, kicking, dancing) well. Floor-level actions are weak with both models: crawling works best with **Mixamo model for humans** turned off and a hands-and-knees pose reference, and sitting down onto the ground does not produce a natural transition. For actions like these, pose references at the key poses do most of the work.
 
 The backend builds UniMate conditioning from the Blender rest skeleton and uses upstream model/sampler code without editing the upstream source. See [the original README](docs/UPSTREAM_README.md) and [the UniMate project](https://github.com/Friedrich-M/UniMate) for the underlying research and model.
 

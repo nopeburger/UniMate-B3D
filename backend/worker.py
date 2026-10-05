@@ -176,7 +176,7 @@ def generate(request, output, status):
     else:
         plan = [(0, {})]
     previous = None
-    parts, spans = [], [None] * len(clips)
+    parts, spans, seams = [], [None] * len(clips), [[] for _ in clips]
     total = 0
     with torch.inference_mode():
         for index, (clip_index, slots) in enumerate(plan):
@@ -189,6 +189,8 @@ def generate(request, output, status):
             previous = samples
             part = samples if index == 0 else samples[..., overlap:]
             parts.append(part)
+            if spans[clip_index]:
+                seams[clip_index].append(total-spans[clip_index][0])
             begin = spans[clip_index][0] if spans[clip_index] else total
             total += part.shape[-1]
             spans[clip_index] = (begin, total)
@@ -199,16 +201,30 @@ def generate(request, output, status):
     if not request.get("clips"):
         features = features[:frames]
     positions, rotations = load_geometry().decode_features(features, canonical)
+    if request.get("smoothing", 0) > 0:
+        from timeline import smooth_motion
+        positions, rotations = smooth_motion(positions, rotations, request["skeleton"], float(request["smoothing"]))
     if request.get("clips"):
         positions, rotations = retime(positions, rotations, spans, clips, request["skeleton"],
                                      request.get("transition_frames", 12),
-                                     request.get("pose_approach_frames", 60))
+                                     request.get("pose_approach_frames", 60), seams)
     collision_report = {}
     if request.get("motion_cleanup", True):
         from collision import cleanup
         write_status(status, "running", "Checking self-collisions, ground contact and joint limits")
+        source_positions, source_rotations = positions, rotations
         positions, rotations, collision_report = cleanup(
-            positions, rotations, request["skeleton"], request.get("ground"))
+            positions, rotations, request["skeleton"], request.get("ground"), request.get("settle_to_ground", True),
+            request.get("self_collision", "auto"), request.get("plant_feet", "auto"))
+        # Captured references stay exact: cleanup may not move them.
+        if request.get("clips"):
+            from timeline import restore_references
+            frames, offset = [], 0
+            for clip in clips:
+                frames += [offset + ref["frame"] - clip["start"] for ref in clip.get("references", [])]
+                offset += clip["end"] - clip["start"] + 1
+            positions, rotations = restore_references(positions, rotations, source_positions,
+                                                      source_rotations, frames, request["skeleton"])
     temp = output.with_suffix(".tmp")
     with temp.open("wb") as handle:
         np.savez_compressed(handle, schema=1, positions=positions, rotations=rotations,
