@@ -176,7 +176,7 @@ def generate(request, output, status):
     else:
         plan = [(0, {})]
     previous = None
-    parts, spans = [], [None] * len(clips)
+    parts, spans, seams = [], [None] * len(clips), [[] for _ in clips]
     total = 0
     with torch.inference_mode():
         for index, (clip_index, slots) in enumerate(plan):
@@ -189,6 +189,8 @@ def generate(request, output, status):
             previous = samples
             part = samples if index == 0 else samples[..., overlap:]
             parts.append(part)
+            if spans[clip_index]:
+                seams[clip_index].append(total-spans[clip_index][0])
             begin = spans[clip_index][0] if spans[clip_index] else total
             total += part.shape[-1]
             spans[clip_index] = (begin, total)
@@ -202,7 +204,7 @@ def generate(request, output, status):
     if request.get("clips"):
         positions, rotations = retime(positions, rotations, spans, clips, request["skeleton"],
                                      request.get("transition_frames", 12),
-                                     request.get("pose_approach_frames", 60))
+                                     request.get("pose_approach_frames", 60), seams)
     collision_report = {}
     if request.get("motion_cleanup", True):
         from collision import cleanup
