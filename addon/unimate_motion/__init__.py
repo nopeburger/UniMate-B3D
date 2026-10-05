@@ -37,6 +37,8 @@ class UniMateSettings(bpy.types.PropertyGroup):
         description="Smooth the generated motion over time, in frames. Calms jitter and fast head or limb jerks that some non-human rigs get (dragons, long necks) at the cost of some sharpness; 1.5 to 2.5 is a good start. 0 leaves the motion as generated")
     motion_cleanup: BoolProperty(name="Motion cleanup", default=True,
         description="Correct self-collisions, ground contact and extreme foot/paw rotations; intersecting reference poses may be adjusted")
+    settle_to_ground: BoolProperty(name="Settle on ground", default=True,
+        description="Lower the motion until its lowest contact bone touches the ground, if it never does. The model sometimes leaves a walking robot or animal hovering; turn off for creatures meant to fly or hover")
     overlap: IntProperty(name="Transition context", default=10, min=1, max=30)
     transition_frames: IntProperty(name="Prompt blend frames", default=12, min=0, max=120, description="Smooth joins between generated prompt clips; zero disables")
     pose_approach_frames: IntProperty(name="Pose approach frames", default=60, min=0, max=600, description="Ease into captured reference poses over this many frames within their clip; replaces motion in that approach with a pose blend; zero disables")
@@ -322,7 +324,7 @@ class UNIMATE_OT_generate(bpy.types.Operator):
             request = dict(schema=1, skeleton=skeleton, prompt=settings.prompt.strip(),
                            experiment=str(exp), stats_family=settings.family, frames=settings.frames,
                            fps=settings.fps, seed=settings.seed, guidance=settings.guidance,
-                           motion_cleanup=settings.motion_cleanup, smoothing=settings.smoothing,
+                           motion_cleanup=settings.motion_cleanup, settle_to_ground=settings.settle_to_ground, smoothing=settings.smoothing,
                            ground=export_ground(rig, skeleton, settings.ground_object) if settings.motion_cleanup else None)
             if settings.mode == "TIMELINE":
                 request.update(clips.collect_schedule(settings, skeleton, context.scene))
@@ -451,6 +453,7 @@ class UNIMATE_PT_main(bpy.types.Panel):
             layout.prop(settings, "ground_object")
             layout.prop(settings, "tips")
             layout.prop(settings, "fingers")
+            layout.prop(settings, "settle_to_ground")
             layout.prop(settings, "guidance")
             layout.prop(settings, "fps")
             layout.prop(settings, "overlap")

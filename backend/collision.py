@@ -201,10 +201,10 @@ def stabilize_feet(positions, rotations, skeleton, max_tilt=30.):
     return pos,rot,changed
 
 
-def cleanup(positions,rotations,skeleton,ground=None):
+def cleanup(positions,rotations,skeleton,ground=None,settle=True):
     from ground import plant
     positions,rotations,initial=solve(positions,rotations,skeleton)
-    positions,rotations,contact=plant(positions,rotations,skeleton,ground)
+    positions,rotations,contact=plant(positions,rotations,skeleton,ground,settle)
     positions,rotations,report=solve(positions,rotations,skeleton)
     report["initial_collision_pass"]=dict(
         maximum_overlap_before=initial.get("max_penetration_before",0.),
