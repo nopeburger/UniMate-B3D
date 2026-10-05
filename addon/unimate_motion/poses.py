@@ -30,6 +30,34 @@ def auto_mapping(rig):
         mapping[role] = matches[0] if len(matches) == 1 else ""
     return mapping
 
+def action_fcurves(rig):
+    """F-curves of the rig's active Action, for Blender's classic and slotted (4.4+) actions."""
+    animation = rig.animation_data
+    action = animation.action if animation else None
+    if action is None:
+        return []
+    if hasattr(action, "layers"):
+        slot = getattr(animation, "action_slot", None)
+        curves = []
+        for layer in action.layers:
+            for strip in layer.strips:
+                bag = strip.channelbag(slot) if slot is not None and hasattr(strip, "channelbag") else None
+                if bag is not None:
+                    curves.extend(bag.fcurves)
+        return curves
+    return list(action.fcurves)
+
+def key_frames(rig, start, end):
+    """Integer frames in [start, end] that have a key on a pose bone of the rig's active Action."""
+    frames = set()
+    for curve in action_fcurves(rig):
+        if curve.data_path.startswith("pose.bones["):
+            for point in curve.keyframe_points:
+                frame = int(round(point.co.x))
+                if start <= frame <= end:
+                    frames.add(frame)
+    return sorted(frames)
+
 def capture_pose(rig, skeleton):
     """Read the current pose in armature space and encode it with encode_pose."""
     parents = skeleton["parents"]

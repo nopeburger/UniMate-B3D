@@ -1,4 +1,25 @@
 """Validation shared by Blender and the inference worker."""
+def thin_frames(frames, minimum_gap):
+    """Keep the first and last frame and drop frames closer than minimum_gap to the last kept one.
+
+    Used to turn a dense set of keyframes into pose references: references too close together
+    cannot be placed on distinct generated frames.
+    """
+    frames = sorted(set(frames))
+    if len(frames) <= 2:
+        return frames
+    kept = [frames[0]]
+    for frame in frames[1:-1]:
+        if frame - kept[-1] >= minimum_gap:
+            kept.append(frame)
+    if frames[-1] - kept[-1] >= minimum_gap:
+        kept.append(frames[-1])
+    elif len(kept) > 1:
+        kept[-1] = frames[-1]   # the last key matters more than a middle one that sits right before it
+    else:
+        kept.append(frames[-1])
+    return kept
+
 def validate_clips(clips, signature):
     if not clips:
         raise ValueError("Add at least one prompt clip.")

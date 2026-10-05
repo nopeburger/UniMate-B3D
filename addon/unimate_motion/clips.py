@@ -10,9 +10,9 @@ import bpy.utils.previews
 from bpy.props import StringProperty, IntProperty, BoolProperty, CollectionProperty
 from bpy_extras.io_utils import ImportHelper
 from .rig import export_skeleton
-from .poses import ROLES, auto_mapping, capture_pose, preview_estimate
+from .poses import ROLES, auto_mapping, capture_pose, key_frames, preview_estimate
 from .posecode import build_schedule as build_posecode_schedule, load_manifest as load_posecode_manifest
-from .schedule import validate_clips
+from .schedule import thin_frames, validate_clips
 
 _previews = None
 
@@ -162,6 +162,53 @@ class UNIMATE_OT_reference_add(bpy.types.Operator):
         except ValueError as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
+
+class UNIMATE_OT_references_from_keys(bpy.types.Operator):
+    bl_idname = "unimate.references_from_keys"
+    bl_label = "Use Keyframes as References"
+    bl_description = ("Pin the rig's own key poses inside this clip as pose references, so the model fills in the motion "
+                      "between them. Reads the keys of the rig's active Action; no image or capture step")
+    bl_options = {"REGISTER", "UNDO"}
+    min_gap: IntProperty(name="Minimum gap", default=10, min=1, max=120,
+        description="Keys closer than this many frames to the previous reference are skipped; the first and last key are kept")
+    def execute(self, context):
+        from . import selected_rig
+        s = context.scene.unimate_motion
+        scene = context.scene
+        original = scene.frame_current
+        try:
+            clip = current_clip(s)
+            rig = selected_rig(context)
+            if rig is None:
+                raise ValueError("Select the rig first.")
+            frames = key_frames(rig, clip.start, clip.end)
+            if not frames:
+                raise ValueError("The rig's active Action has no keys on pose bones inside this clip.")
+            taken = {r.frame for r in clip.references}
+            wanted = [f for f in thin_frames(frames, self.min_gap) if f not in taken]
+            if not wanted:
+                raise ValueError("Every key in this clip already has a reference, or is too close to one.")
+            skeleton = export_skeleton(rig, s.forward, s.tips, s.fingers)
+            added = []
+            for frame in wanted:
+                scene.frame_set(frame)
+                context.view_layer.update()
+                try:
+                    pose = capture_pose(rig, skeleton)
+                except ValueError as exc:
+                    raise ValueError(f"Frame {frame}: {exc}") from None
+                ref = clip.references.add()
+                ref.uid = uuid.uuid4().hex
+                ref.frame, ref.pose_json = frame, json.dumps(pose)
+                added.append(frame)
+            clip.reference_index = len(clip.references) - 1
+            s.status = f"Added {len(added)} pose references from keys at frames " + ", ".join(map(str, added))
+            return {"FINISHED"}
+        except Exception as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        finally:
+            scene.frame_set(original)
 
 class UNIMATE_OT_reference_remove(bpy.types.Operator):
     bl_idname = "unimate.reference_remove"
@@ -316,6 +363,7 @@ def draw_timeline(layout, context):
     row = box.row(align=True)
     row.operator("unimate.reference_add", text="Add", icon="ADD")
     row.operator("unimate.reference_remove", text="Remove", icon="REMOVE")
+    box.operator("unimate.references_from_keys", icon="KEYFRAME")
     if clip.references:
         if len(clip.references) > 1:
             box.prop(clip, "reference_index", text="Reference index (0-based)")
@@ -360,6 +408,6 @@ def cleanup():
 
 CLASSES = (UniMateReference, UniMateClip, UniMateBoneMapping, UNIMATE_UL_clips,
     UNIMATE_OT_clip_add, UNIMATE_OT_clip_remove, UNIMATE_OT_import_posecode,
-    UNIMATE_OT_reference_add, UNIMATE_OT_reference_remove,
+    UNIMATE_OT_reference_add, UNIMATE_OT_references_from_keys, UNIMATE_OT_reference_remove,
     UNIMATE_OT_reference_image, UNIMATE_OT_map_human, UNIMATE_OT_estimate_pose,
     UNIMATE_OT_preview_pose, UNIMATE_OT_capture_pose)
