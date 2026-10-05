@@ -11,8 +11,9 @@ one sentence) and retries with sampling until it passes.
 
 Nothing is modified in place: the result is a patch JSON
 ``{clip: {"old": ..., "new": ..., "ok": bool, "tries": n}}`` that
-``data_process/tools/patch_annotations.py`` applies (after review) to
-``motion_captions.json``.
+``data_process/tools/patch_annotations.py`` applies to ``motion_captions.json``
+when it is saved as ``<patch_dir>/<dataset>_captions_llm.json``: entries
+with ``ok`` true, while the caption still equals ``old``. Review it first.
 
 Usage:
     python data_process/vlm_caption/caption_rewrite_llm.py \\

@@ -22,8 +22,16 @@ Accepts both motion formats, auto-detected from the NPZ keys:
         :mod:`animate_motion`;
       * WITHOUT them, the asset itself is taken as the canonical motion
         skeleton — the cond-free path for assets baked by
-        :mod:`preprocess_char` (joint order = bone order, rest = the
+        ``rig_preprocess`` (joint order = bone order, rest = the
         asset's rest, scale = 1).
+      * A canonical asset (``canonical_joint_order`` property: from
+        ``feature_extraction/canonical_assets.py`` or rig_preprocess) always
+        takes the cond-free path, ``--dataset_type`` or not.
+
+``--char_path`` may be omitted with ``--dataset_type``: a feature NPZ then
+drives the canonical asset ``dataset/canonical_assets/<ds>/<name>.glb``, an
+export NPZ the export asset ``dataset/export/<ds>/rigs/<name>.glb``; <name>
+is the clip's object type, for Mixamo ``--character`` (default Michelle).
 
 Bones are matched to the asset by name. Asset bones missing from the motion
 keep their rest local transform (they follow their parent, the ``'keep'``
@@ -55,13 +63,19 @@ from loguru import logger
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
-from Animation import transforms_local  # noqa: E402
+from Animation import transforms_global, transforms_local  # noqa: E402
 
 from data_process.mesh_animation.common import (  # noqa: E402
+    DEFAULT_MIXAMO_CHARACTER,
+    canonical_joint_order,
+    is_canonical_asset,
+    is_feature_motion,
     load_character,
     npz_scalar,
     parse_blender_argv,
     quat_pos_to_mats,
+    resolve_processed_asset,
+    rotations_to_quats,
 )
 from data_process.utils.blender_rig import (  # noqa: E402
     compute_bone_keyframes,
@@ -71,6 +85,7 @@ from data_process.utils.blender_rig import (  # noqa: E402
     set_scene_timing,
     update_scene,
 )
+from data_process.utils.skeleton import motion_axis_alignment  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -139,20 +154,24 @@ def extract_skin(char_armature):
     logger.info(f"Extracted {len(vertices)} vertices ({(~skinned).sum()} unskinned), "
                 f"{len(all_faces)} faces, {len(bones)} bones from {len(meshes)} mesh(es)")
 
-    # Canonical joint order baked in by preprocess_char (glTF extras carry
+    # Canonical joint order baked into a canonical asset (glTF extras carry
     # object-level custom properties); bone enumeration order itself is not
     # stable across glTF round trips.
     import json
-    order = (char_armature.get('canonical_joint_order')
-             or char_armature.data.get('canonical_joint_order'))
-    if isinstance(order, str):
-        order = json.loads(order)
+    order = canonical_joint_order(char_armature)
+    # The clips' rest root, on a Mixamo character baked by canonical_assets.py
+    # (its own rest root differs: motion_from_canonical_char).
+    motion_root = (char_armature.get('canonical_motion_rest_root')
+                   or char_armature.data.get('canonical_motion_rest_root'))
+    if isinstance(motion_root, str):
+        motion_root = json.loads(motion_root)
 
     return {
         'bone_names': bone_names, 'parents': parents,
         'rest_global': rest_global, 'rest_local': rest_local,
         'vertices': vertices, 'weights': weights, 'faces': all_faces,
         'arm_world': arm_world, 'canonical_order': order,
+        'motion_rest_root': None if motion_root is None else np.asarray(motion_root, dtype=np.float64),
     }
 
 
@@ -161,7 +180,8 @@ def extract_skin(char_armature):
 # ---------------------------------------------------------------------------
 
 def load_motion_local_mats(anim_path, dataset_type=None, cond_path=None):
-    """Return ``(anim_local (F,J,4,4), rest_local (J,4,4), bone_names, fps)``.
+    """Return ``(anim_local (F,J,4,4), rest_local (J,4,4), bone_names, fps,
+    rest_global (J,4,4))``.
 
     Auto-detects the NPZ flavor: export-stage (self-contained) vs
     feature-format (generated motion; resolved through ``cond.npy`` exactly
@@ -181,11 +201,12 @@ def load_motion_local_mats(anim_path, dataset_type=None, cond_path=None):
         # Either flag resolves the cond: --dataset_type picks the dataset's
         # default cond.npy (and the 'mixamo' key), --cond_path names the file
         # directly (object type from the clip's filename prefix, or the file's
-        # single entry — a preprocess_char cond has exactly one).
+        # single entry — a rig_preprocess cond has exactly one).
         if not dataset_type and not cond_path:
             raise RuntimeError(
                 "feature-format motion needs --dataset_type and/or --cond_path "
-                "(omit both only for a canonical asset from preprocess_char)")
+                "(omit both only for a canonical asset: rig_preprocess, "
+                "canonical_assets.py)")
         cond_path = cond_path or COND_PATH_TEMPLATE.format(dataset_type=dataset_type)
         cond_data = load_cond_data(cond_path, anim_path, dataset_type)
         anim, rest_anim, _tpos, raw = build_anim_from_npz(anim_path, cond_data)
@@ -197,16 +218,20 @@ def load_motion_local_mats(anim_path, dataset_type=None, cond_path=None):
             "export-stage ('anim_local_rot', ...) or feature format "
             "('local_rotations', ...)")
     return (transforms_local(anim), transforms_local(rest_anim)[0],
-            [str(n) for n in names], fps)
+            [str(n) for n in names], fps, transforms_global(rest_anim)[0])
 
 
 def motion_from_canonical_char(data, skin):
-    """Feature NPZ driving a canonical asset (:mod:`preprocess_char` output).
+    """Feature NPZ driving a canonical asset (``rig_preprocess`` or ``canonical_assets.py`` output).
 
     The asset's own skeleton IS the motion skeleton: joint order = bone
     order, rest pose = the asset's rest, scale = 1 — so no ``cond.npy`` is
     needed. Root positions come from ``global_positions``; every other joint
     keeps its rest offset (rigid bones), rotations from ``local_rotations``.
+    A Mixamo character other than the clips' rig stores the clips' rest root
+    (``canonical_motion_rest_root``): its root then moves by the clip's change
+    from that rest, starting from its own rest root, as :mod:`animate_motion`
+    retargets the root, so its feet stay on the ground.
     """
     q = np.asarray(data['local_rotations'], dtype=np.float64)     # (F, J, 4) wxyz
     gp = np.asarray(data['global_positions'], dtype=np.float64)   # (F, J, 3)
@@ -214,14 +239,15 @@ def motion_from_canonical_char(data, skin):
     order = skin.get('canonical_order')
     if order is None:
         logger.warning("Asset carries no canonical_joint_order property (not "
-                       "produced by preprocess_char?); assuming its bone "
+                       "produced by rig_preprocess / canonical_assets.py?); "
+                       "assuming its bone "
                        "enumeration order matches the motion's joint order")
         order = list(skin['bone_names'])
     J = len(order)
     assert q.shape[1] == J, (
         f"motion has {q.shape[1]} joints but the asset's canonical skeleton "
         f"has {J} bones; the cond-free path needs an asset baked to the "
-        f"motion skeleton (see preprocess_char.py) — or pass "
+        f"motion skeleton (rig_preprocess, canonical_assets.py) — or pass "
         f"--dataset_type/--cond_path")
     missing = [n for n in order if n not in skin['bone_names']]
     assert not missing, f"canonical_joint_order names missing from armature: {missing}"
@@ -230,6 +256,8 @@ def motion_from_canonical_char(data, skin):
     rest_local = skin['rest_local'][idx]                 # motion joint order
     pos = np.repeat(rest_local[None, :, :3, 3], q.shape[0], axis=0)
     pos[:, 0] = gp[:, 0]
+    if skin.get('motion_rest_root') is not None:
+        pos[:, 0] += rest_local[0, :3, 3] - skin['motion_rest_root']
     anim_local = quat_pos_to_mats(q, pos)
     return anim_local, rest_local, list(order), npz_scalar(data, 'fps', 30)
 
@@ -238,10 +266,11 @@ def motion_from_canonical_char(data, skin):
 # Manual LBS
 # ---------------------------------------------------------------------------
 
-def lbs_deform(skin, anim_local, motion_rest_local, motion_bone_names):
+def lbs_deform(skin, anim_local, motion_rest_local, motion_bone_names, conj=None):
     """Run manual Linear Blend Skinning; returns world-space ``(F, V, 3)``.
 
-    Per frame and asset bone::
+    Per frame and asset bone (*conj*: optional ``(J, 3, 3)`` per-motion-bone
+    rotations from :func:`motion_axis_alignment`, conjugating ``rel``)::
 
         pose_local[b] = rest_local[b] @ inv(m_rest[b]) @ m_anim[f, b]   (driven)
         pose_local[b] = rest_local[b]                                    (undriven)
@@ -274,6 +303,10 @@ def lbs_deform(skin, anim_local, motion_rest_local, motion_bone_names):
     pose_local = np.broadcast_to(skin['rest_local'], (nframes, nbones, 4, 4)).copy()
     for b, j in driven:
         rel = np.linalg.inv(motion_rest_local[j])[None] @ anim_local[:, j]
+        if conj is not None:
+            C = np.eye(4)
+            C[:3, :3] = conj[j]
+            rel = C.T[None] @ rel @ C[None]
         pose_local[:, b] = skin['rest_local'][b][None] @ rel
 
     # FK to armature space (bones are stored parent-before-child in Blender).
@@ -311,26 +344,50 @@ def save_obj_sequence(dirpath, vertices, faces):
     logger.info(f"Saved {vertices.shape[0]} OBJ frames to {dirpath}")
 
 
+def resolve_lbs_char(anim_path, dataset_type, character=None):
+    """The processed asset for a motion (module docstring): canonical for a
+    feature NPZ, export for an export NPZ."""
+    if not dataset_type:
+        raise ValueError("--char_path is required without --dataset_type")
+    kind = 'canonical' if is_feature_motion(anim_path) else 'export'
+    return resolve_processed_asset(anim_path, dataset_type, kind, character)
+
+
 def animate_lbs(char_path, anim_path, output_dir, dataset_type=None,
-                cond_path=None, save=('glb',)):
-    """Deform a rigged asset with a motion NPZ via manual LBS and save."""
+                cond_path=None, save=('glb',), character=None):
+    """Deform a rigged asset with a motion NPZ via manual LBS and save.
+    *char_path* None: :func:`resolve_lbs_char`."""
     assert os.path.exists(anim_path), f"Animation file not found: {anim_path}"
+    if not anim_path.endswith('.npz'):
+        raise ValueError(
+            f"{anim_path}: animate_lbs reads motion NPZs (stage-1 export or stage-4 "
+            f"feature format). Drive a sampler .npy with animate_motion "
+            f"(scripts/run_animate_motion.sh <samples_dir>).")
     os.makedirs(output_dir, exist_ok=True)
+    char_path = char_path or resolve_lbs_char(anim_path, dataset_type, character)
 
     rig_formats = tuple(f for f in save if f in ('glb', 'fbx'))
     char_armature = load_character(char_path, pack_textures=bool(rig_formats))
     skin = extract_skin(char_armature)
 
     data = np.load(anim_path, allow_pickle=True)
-    if 'local_rotations' in data and dataset_type is None and cond_path is None:
-        logger.info("Feature NPZ with no cond: treating the asset as the "
-                    "canonical motion skeleton (preprocess_char output)")
+    if 'local_rotations' in data and (is_canonical_asset(char_armature)
+                                      or (dataset_type is None and cond_path is None)):
+        logger.info("Feature NPZ on a canonical asset: the asset is the motion "
+                    "skeleton (no cond)")
+        if cond_path is not None:
+            logger.warning(f"--cond_path {cond_path} not used: the canonical asset "
+                           f"carries the motion's skeleton")
         anim_local, rest_local, motion_names, fps = motion_from_canonical_char(data, skin)
+        conj = None
     else:
-        anim_local, rest_local, motion_names, fps = load_motion_local_mats(
+        anim_local, rest_local, motion_names, fps, rest_global = load_motion_local_mats(
             anim_path, dataset_type=dataset_type, cond_path=cond_path)
+        # The asset's bone axes may differ from the motion's.
+        conj = motion_axis_alignment(rest_global, motion_names,
+                                     skin['rest_global'], skin['bone_names'])
 
-    vertices = lbs_deform(skin, anim_local, rest_local, motion_names)
+    vertices = lbs_deform(skin, anim_local, rest_local, motion_names, conj=conj)
 
     stem = os.path.splitext(os.path.basename(anim_path))[0] + '_lbs'
     faces_arr = np.array(skin['faces'], dtype=object)
@@ -350,7 +407,9 @@ def animate_lbs(char_path, anim_path, output_dir, dataset_type=None,
         # keep their rest local transform (no keyframes = follow parent),
         # matching the LBS 'keep' semantics.
         set_scene_timing(anim_local.shape[0], fps)
-        keyframes = compute_bone_keyframes(rest_local, anim_local, motion_names)
+        keyframes = compute_bone_keyframes(
+            rest_local, anim_local, motion_names,
+            None if conj is None else rotations_to_quats(conj))
         rebuild_action_from_data(char_armature, keyframes)
         update_scene()
         export_animated_character(os.path.join(output_dir, stem),
@@ -358,19 +417,28 @@ def animate_lbs(char_path, anim_path, output_dir, dataset_type=None,
     return vertices
 
 
+# Outputs ``--save`` can ask for (see animate_lbs).
+SAVE_FORMATS = ('glb', 'fbx', 'npz', 'obj')
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Animate a rigged asset via manual NumPy LBS.")
-    parser.add_argument("--char_path", type=str, required=True,
-                        help="Rigged asset GLB/FBX (mesh + armature + weights).")
+    parser.add_argument("--char_path", type=str, default=None,
+                        help="Rigged asset GLB/FBX (mesh + armature + weights). Default with "
+                             "--dataset_type: the processed asset (module docstring).")
+    parser.add_argument("--character", type=str, default=None,
+                        help=f"Mixamo character for the auto-resolved asset "
+                             f"(default {DEFAULT_MIXAMO_CHARACTER}).")
     parser.add_argument("--anim_path", type=str, required=True,
                         help="Motion NPZ (export-stage or feature-format, auto-detected), "
                              "or a DIRECTORY of NPZs — one output set per action clip.")
     parser.add_argument("--dataset_type", type=str, default=None,
-                        choices=['truebones', 'objaverse', 'mixamo'],
-                        help="For feature-format motion: resolves cond.npy. Omit it "
-                             "(and --cond_path) to drive a canonical asset baked by "
-                             "preprocess_char.py cond-free.")
+                        choices=['truebones', 'objaverse', 'mixamo', 'general'],
+                        help="Resolves --char_path when omitted (the processed asset of "
+                             "the clip: canonical for a feature NPZ, export for an export "
+                             "NPZ) and, for a feature NPZ on a non-canonical asset, "
+                             "cond.npy. A canonical asset is always driven cond-free.")
     parser.add_argument("--cond_path", type=str, default=None,
                         help="cond.npy override for feature-format motion.")
     parser.add_argument("--output_dir", type=str, default='outputs/lbs')
@@ -384,6 +452,10 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     save = tuple(s.strip() for s in args.save.split(',') if s.strip())
+    unknown = sorted(set(save) - set(SAVE_FORMATS))
+    if unknown or not save:
+        raise SystemExit(f"--save {args.save!r}: expected a comma-separated subset of "
+                         f"{', '.join(SAVE_FORMATS)}")
 
     if os.path.isdir(args.anim_path):
         import glob as _glob
@@ -396,7 +468,7 @@ if __name__ == "__main__":
             lambda clip: animate_lbs(
                 char_path=args.char_path, anim_path=clip,
                 output_dir=args.output_dir, dataset_type=args.dataset_type,
-                cond_path=args.cond_path, save=save),
+                cond_path=args.cond_path, save=save, character=args.character),
             output_dir=args.output_dir,
             desc="LBS animating",
         )
@@ -408,4 +480,5 @@ if __name__ == "__main__":
             dataset_type=args.dataset_type,
             cond_path=args.cond_path,
             save=save,
+            character=args.character,
         )

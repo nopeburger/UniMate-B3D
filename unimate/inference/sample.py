@@ -1,4 +1,12 @@
-"""Inference entry point: generate motion samples from a trained model."""
+"""Inference entry point: generate motion samples from a trained model.
+
+The skeletons are named by reference (``unimate.inference.assets``): a
+``data_process.rig_preprocess`` output, a cond file, or a dataset object type.
+With test cases (``--test_cases_json``, ``--test_cases_txt``, or ``--asset``
+with ``--prompt``) only those assets are read, so a run needs no dataset on
+disk beyond them; without any, the dataset's own split is enumerated.
+Next to the motions it writes ``manifest.json`` (see :class:`SampleManifest`).
+"""
 import dataclasses
 import gc
 import glob
@@ -19,13 +27,14 @@ warnings.filterwarnings("ignore")
 
 from unimate.configs.schema import MainConfig
 from unimate.dataset.conditioning import create_sample_condition
-from unimate.dataset.factory import create_dataset
+from unimate.dataset.factory import create_dataset, create_skeleton_dataset
 from unimate.inference.motion_inbetweening import build_keep_mask, parse_keep_frames
 from unimate.inference.motion_editing import (
     build_joint_keep_mask,
     get_joint_names,
     parse_keep_joints,
 )
+from unimate.inference.assets import Asset, AssetResolver
 from unimate.inference.motion_expansion import expand_motion_chain
 from unimate.models.flow.transport import Sampler
 from unimate.models.factory import create_diffusion, create_model, create_transport
@@ -58,12 +67,25 @@ class InferenceArgs:
     output_dir: Optional[str] = None
     num_repetitions: int = 1
     cfg_scale: Optional[float] = None
-    # JSON of {"<object_type>-<case_id>": caption}; used when cfg_scale > 1.0.
-    # When None, every clip in the dataset is enumerated as a test case.
+    # Test cases at cfg_scale > 1.0: a JSON map {"<asset>-<case_id>": prompt}
+    # (<asset> a name or '<dataset>:<object_type>'; prompt lists for
+    # --motion_expand; <case_id> is the pinned clip id for --inbetween /
+    # --motion_edit), or a JSON list of {"asset": ref, "prompt": ...,
+    # "id": case_id, "clip": clip_id} (ref also a rig_preprocess output
+    # directory or a cond file). When neither this nor --prompt is given,
+    # every clip of the dataset's eval split is enumerated as a test case.
     test_cases_json: Optional[str] = None
-    # Plain-text object_types (one per line) for unconditional sampling at
-    # cfg_scale == 1.0. '#' starts a comment.
+    # Assets for unconditional sampling at cfg_scale == 1.0, one reference
+    # per line. '#' starts a comment.
     test_cases_txt: Optional[str] = None
+    # Assets by reference (unimate.inference.assets): a rig_preprocess output
+    # directory, a one-entry cond.npy, '<dataset>:<object_type>' or a name.
+    # With --prompt (or alone at cfg_scale 1.0) they are the test cases;
+    # with --test_cases_json the test cases can name them.
+    asset: Tuple[str, ...] = ()
+    # Prompts sampled on every --asset, one test case each (for
+    # --motion_expand: the segments of one chain per asset).
+    prompt: Tuple[str, ...] = ()
     # Per-chunk inference batch size — caps GPU memory regardless of total count.
     batch_size: int = 64
     # Skip mp4/PNG renders; write only the .npy motion features.
@@ -99,7 +121,8 @@ class InferenceArgs:
     gt_start_frame: Optional[int] = None
     # Motion expansion: chain multiple text-conditioned generations into one
     # long motion. Requires --test_cases_json whose values are *lists* of
-    # prompts (one segment per prompt). Each segment after the first pins
+    # prompts (one segment per prompt), or --asset with --prompt (the
+    # segments, one chain per asset). Each segment after the first pins
     # its first `expand_overlap` frames to the previous segment's last
     # `expand_overlap` frames via replacement-style sampling. Mutually
     # exclusive with --inbetween / --motion_edit.
@@ -107,6 +130,15 @@ class InferenceArgs:
     # Number of frames overlapped (clamped) between consecutive expansion
     # segments. Must satisfy 0 < expand_overlap < max_motion_length.
     expand_overlap: int = 10
+    # cond.npy files of {object_type: cond} (a feature directory's, or a
+    # rig_preprocess output's) whose entries the test cases can name: after
+    # the --asset assets and before the run's datasets.
+    cond_path: Tuple[str, ...] = ()
+    # Dataset whose normalization stats apply to every asset that is not a
+    # dataset object type. Default: the cond file's feature directory, else
+    # the rig_preprocess summary.json's stats_dataset / reference / profile,
+    # else objaverse. Irrelevant for a run with one global stats pool.
+    cond_dataset_type: Optional[str] = None
 
 
 class _UnconditionalWrapper(nn.Module):
@@ -184,21 +216,6 @@ def _load_checkpoint(model, model_path: str, config: MainConfig):
         logger.info("Using standard model weights (no EMA).")
 
 
-# ---------------------------------------------------------------------------
-# Test-case loaders
-# ---------------------------------------------------------------------------
-
-
-def _known_object_types(dataset) -> set:
-    """Object types with at least one train or eval clip — only these can
-    realize a test case (otherwise no reference clip is available)."""
-    md = dataset.motion_dataset
-    return {
-        ot for ot in md.cond_dict.keys()
-        if md.train_object_motions_map.get(ot) or md.eval_object_motions_map.get(ot)
-    }
-
-
 def _make_text_encoder(config: MainConfig, device: torch.device):
     # pool=False so a prompt yields its token sequence; ``_encode_prompt``
     # derives the pooled vector from it, the same rule the data loader uses.
@@ -232,68 +249,6 @@ def _release_gpu():
         torch.cuda.empty_cache()
 
 
-def _resolve_inference_scope(args: InferenceArgs) -> Tuple[Optional[set], Optional[set]]:
-    """Return ``(target_object_types, target_clip_stems)`` extracted from the
-    test-case spec, or ``(None, None)`` when neither file is supplied.
-
-    ``target_clip_stems`` is populated only for in-betweening / motion
-    editing — they pin specific GT clips that must actually be on disk.
-    """
-    object_types: Optional[set] = None
-    clip_stems: Optional[set] = None
-
-    if args.test_cases_json is not None:
-        with open(args.test_cases_json) as f:
-            raw_cases = json.load(f)
-        object_types = set()
-        if args.inbetween or args.motion_edit:
-            clip_stems = set()
-        for case_key in raw_cases:
-            obj_type, _, clip_id = case_key.partition('-')
-            if obj_type:
-                object_types.add(obj_type)
-            if clip_stems is not None and clip_id:
-                # On-disk file stem is "{obj_type}-{clip_id}" for
-                # Truebones/Objaverse and "{obj_type}_{clip_id}" for Mixamo
-                # (prefixed at load). Also keep the literal clip_id for
-                # users who already supply the full stem in case_key.
-                clip_stems.add(clip_id)
-                clip_stems.add(f"{obj_type}-{clip_id}")
-                clip_stems.add(f"{obj_type}_{clip_id}")
-        logger.info(
-            f"Inference scope from {args.test_cases_json}: "
-            f"{len(object_types)} object types"
-            + (f", {len(clip_stems)} pinned clip stems" if clip_stems else '')
-        )
-
-    if args.test_cases_txt is not None:
-        if object_types is None:
-            object_types = set()
-        with open(args.test_cases_txt) as f:
-            for line in f:
-                s = line.strip()
-                if s and not s.startswith('#'):
-                    object_types.add(s)
-        logger.info(
-            f"Inference scope augmented from {args.test_cases_txt}: "
-            f"{len(object_types)} object types total."
-        )
-
-    return object_types, clip_stems
-
-
-def _resolve_stats_path(exp_dir: str) -> Optional[str]:
-    """Return path to ``dataset_stats.npy`` in ``exp_dir``, or ``None``."""
-    candidate = os.path.join(exp_dir, "dataset_stats.npy")
-    if os.path.isfile(candidate):
-        return candidate
-    logger.warning(
-        f"No dataset_stats.npy at {candidate} — stats will be recomputed from "
-        f"the loaded clips, which may not match training-time normalization."
-    )
-    return None
-
-
 def _resolve_clip_name(dataset, obj_type: str, clip_id: str) -> Optional[str]:
     """Find the dataset key whose stem matches ``clip_id`` for ``obj_type``.
 
@@ -314,114 +269,6 @@ def _resolve_clip_name(dataset, obj_type: str, clip_id: str) -> Optional[str]:
             if stem in candidates and source[clip_name].get('object_type') == obj_type:
                 return clip_name
     return None
-
-
-def _load_test_cases_json(
-    json_path: str,
-    config: MainConfig,
-    dataset,
-    device: torch.device,
-    resolve_clip: bool = False,
-) -> List[TestCase]:
-    """Caption-conditioned cases from {"<object_type>-<id>": caption} JSON.
-
-    When ``resolve_clip`` is True (in-betweening), the ``<id>`` portion is
-    treated as a dataset clip stem and must resolve to an actual clip in
-    train or eval motion_dict — otherwise the case is dropped, since
-    in-betweening has nothing to clamp against. When False, ``<id>`` is a
-    free-form tag and only ``<object_type>`` needs to exist.
-    """
-    with open(json_path) as f:
-        raw_cases: Dict[str, str] = json.load(f)
-
-    known = _known_object_types(dataset)
-    cases: List[Tuple[str, str, str, Optional[str]]] = []
-    for case_key, caption in raw_cases.items():
-        obj_type, _, clip_id = case_key.partition('-')
-        if obj_type not in known:
-            logger.warning(
-                f"Test case {case_key!r}: object_type={obj_type!r} not in dataset; skipping."
-            )
-            continue
-        # An empty caption at cfg>1 collapses to ~unconditional output and
-        # is almost always a data-entry mistake; skip rather than silently
-        # generating garbage.
-        if not caption or not caption.strip():
-            logger.warning(f"Test case {case_key!r}: empty caption; skipping.")
-            continue
-
-        resolved_clip: Optional[str] = None
-        if resolve_clip:
-            if not clip_id:
-                logger.warning(
-                    f"Test case {case_key!r}: in-betweening requires "
-                    f"'<object_type>-<clip_id>' format with a non-empty id; skipping."
-                )
-                continue
-            resolved_clip = _resolve_clip_name(dataset, obj_type, clip_id)
-            if resolved_clip is None:
-                logger.warning(
-                    f"Test case {case_key!r}: clip_id={clip_id!r} not found in "
-                    f"train or eval motion_dict for object_type={obj_type!r}; skipping."
-                )
-                continue
-
-        cases.append((case_key, obj_type, caption, resolved_clip))
-
-    if not cases:
-        raise ValueError(
-            f"No usable test cases in {json_path}: object_types not present in dataset."
-        )
-    logger.info(f"Loaded {len(cases)} test cases from {json_path}")
-
-    encoder = _make_text_encoder(config, device)
-    encoded: List[TestCase] = []
-    for case_key, obj_type, caption, clip_name in cases:
-        encoded.append((case_key, obj_type, caption,
-                        _encode_prompt(encoder, caption), clip_name))
-    del encoder
-    _release_gpu()
-    return encoded
-
-
-def _load_test_cases_txt(
-    txt_path: str,
-    config: MainConfig,
-    dataset,
-    device: torch.device,
-) -> List[TestCase]:
-    """Unconditional cases — one object_type per line.
-
-    The empty-string embedding is a shape-only placeholder; ``_UnconditionalWrapper``
-    zeroes it inside the model at sample time.
-    """
-    with open(txt_path) as f:
-        object_types = [
-            line.strip() for line in f
-            if line.strip() and not line.lstrip().startswith('#')
-        ]
-
-    known = _known_object_types(dataset)
-    cases = []
-    for ot in object_types:
-        if ot not in known:
-            logger.warning(f"object_type={ot!r} not in dataset; skipping.")
-            continue
-        cases.append(ot)
-
-    if not cases:
-        raise ValueError(
-            f"No usable test cases in {txt_path}: object_types not present in dataset."
-        )
-    logger.info(f"Loaded {len(cases)} unconditional test cases from {txt_path}")
-
-    encoder = _make_text_encoder(config, device)
-    null_emb = _encode_prompt(encoder, "")
-    del encoder
-    _release_gpu()
-
-    # case_id == object_type since txt rows have no per-case suffix.
-    return [(ot, ot, "", null_emb, None) for ot in cases]
 
 
 def _load_test_cases_from_dataset(dataset) -> List[TestCase]:
@@ -492,104 +339,302 @@ def _load_test_cases_from_dataset(dataset) -> List[TestCase]:
     return encoded
 
 
-def _load_expand_test_cases(
-    json_path: str,
-    config: MainConfig,
-    dataset,
-    device: torch.device,
-) -> List[Tuple[str, str, List[str], List[np.ndarray]]]:
-    """Motion-expand cases from {"<object_type>-<label>": [prompt, ...]} JSON.
+# ---------------------------------------------------------------------------
+# Test cases: what to sample, on which asset
+# ---------------------------------------------------------------------------
 
-    Each value must be a non-empty list of non-empty strings. The list
-    order is the segment order: prompt[0] drives the free first segment,
-    prompt[i>0] drives a follow-up segment whose first ``expand_overlap``
-    frames are clamped to the previous segment's last ``expand_overlap``
-    frames.
 
-    Returns ``[(case_id, object_type, [prompts], [caption_embs])]``.
-    Unlike motion-edit / in-betweening, no GT clip is pinned — only the
-    skeleton from ``<object_type>`` is needed.
+@dataclasses.dataclass
+class CaseSpec:
+    """One test case before its asset is resolved.
+
+    ``ref`` names the asset (``unimate.inference.assets``); ``tag`` is the
+    free part of the case id (output files are ``<asset>-<tag>-rep_<r>-<i>.npy``,
+    or ``<asset>-rep_...`` without one); ``prompt`` a string, a list of
+    strings (``--motion_expand``) or ``''`` (unconditional); ``clip`` the
+    clip id whose ground truth in-betweening / motion editing hold.
     """
-    with open(json_path) as f:
-        raw_cases = json.load(f)
+    ref: str
+    tag: Optional[str]
+    prompt: object
+    clip: Optional[str] = None
+    asset: Optional[Asset] = None
 
-    known = _known_object_types(dataset)
-    cases: List[Tuple[str, str, List[str]]] = []
-    for case_key, prompts in raw_cases.items():
-        obj_type, _, _ = case_key.partition('-')
-        if obj_type not in known:
-            logger.warning(
-                f"Test case {case_key!r}: object_type={obj_type!r} not in dataset; skipping."
-            )
-            continue
-        if not isinstance(prompts, list):
-            logger.warning(
-                f"Test case {case_key!r}: value must be a list of prompts for "
-                f"--motion_expand (got {type(prompts).__name__}); skipping."
-            )
-            continue
-        valid = [p.strip() for p in prompts if isinstance(p, str) and p.strip()]
-        if len(valid) != len(prompts):
-            logger.warning(
-                f"Test case {case_key!r}: {len(prompts) - len(valid)} prompt(s) "
-                f"empty or non-string; keeping {len(valid)}/{len(prompts)}."
-            )
-        if not valid:
-            logger.warning(f"Test case {case_key!r}: no usable prompts; skipping.")
-            continue
-        cases.append((case_key, obj_type, valid))
-
-    if not cases:
-        raise ValueError(
-            f"No usable motion-expand test cases in {json_path}."
-        )
-    logger.info(f"Loaded {len(cases)} motion-expand test cases from {json_path}.")
-
-    encoder = _make_text_encoder(config, device)
-    encoded: List[Tuple[str, str, List[str], List[np.ndarray]]] = []
-    for case_key, obj_type, prompts in cases:
-        embs = [_encode_prompt(encoder, p) for p in prompts]
-        encoded.append((case_key, obj_type, prompts, embs))
-    del encoder
-    _release_gpu()
-    return encoded
+    @property
+    def case_id(self) -> str:
+        return f'{self.asset.name}-{self.tag}' if self.tag else self.asset.name
 
 
-def _select_test_cases(
-    args: InferenceArgs,
-    cfg_scale: float,
-    config: MainConfig,
-    dataset,
-    device: torch.device,
-    resolve_clip: bool = False,
-) -> List[TestCase]:
-    """Test-case selection at cfg > 1.0, in priority order:
+def _slug(text: str, max_len: int = 48) -> str:
+    """A file-name tag from a prompt: its words, lower-case, joined by '_'."""
+    words = re.findall(r'[a-z0-9]+', str(text).lower())
+    slug = ''
+    for w in words:
+        if len(slug) + len(w) + 1 > max_len:
+            break
+        slug = f'{slug}_{w}' if slug else w
+    return slug or 'case'
 
-    1. ``--test_cases_json`` provided
-       → use the JSON's ``{object_type-id: prompt}`` map verbatim
-         (curated prompts).
-    2. dataset's eval split populated by ``test_objects.txt``
-       → per-clip enumeration over the listed object_types (eval mode).
-    3. dataset's eval split populated by ``test_split_ratio > 0``
-       → per-clip enumeration over the random eval clips (eval mode).
-    4. no JSON, no eval split
-       → dedup'd unique ``(object_type, caption)`` prompts from the train
-         split (visualization sweep).
 
-    Cases 2/3/4 are all handled by ``_load_test_cases_from_dataset``, which
-    introspects the dataloader's split state and logs which source it used.
+def _cases_from_json(path: str, needs_gt: bool) -> List[CaseSpec]:
+    """Cases of a test-case file: a ``{"<asset>-<tag>": prompt}`` map (the tag
+    is also the pinned clip id of in-betweening / motion editing), or a list of
+    ``{"asset": ref, "prompt": ..., "id": tag, "clip": clip id}`` entries
+    (``id`` and ``clip`` optional; the tag defaults to the clip id, else a slug
+    of the prompt)."""
+    with open(path) as f:
+        raw = json.load(f)
+    specs = []
+    if isinstance(raw, dict):
+        for key, prompt in raw.items():
+            ref, _, tag = key.partition('-')
+            specs.append(CaseSpec(ref=ref, tag=tag or None, prompt=prompt,
+                                  clip=(tag or None) if needs_gt else None))
+    elif isinstance(raw, list):
+        for i, entry in enumerate(raw):
+            if not isinstance(entry, dict) or not entry.get('asset'):
+                raise ValueError(f"{path} entry {i}: expected an object with an 'asset' key.")
+            prompt = entry.get('prompt', '')
+            clip = entry.get('clip') or (entry.get('id') if needs_gt else None)
+            first = prompt[0] if isinstance(prompt, list) and prompt else prompt
+            tag = entry.get('id') or clip or (_slug(first) if first else None)
+            specs.append(CaseSpec(ref=str(entry['asset']), tag=tag, prompt=prompt,
+                                  clip=clip))
+    else:
+        raise ValueError(f"{path}: expected a JSON object or list of test cases.")
+    if not specs:
+        raise ValueError(f"No test cases in {path}.")
+    return specs
 
-    At cfg == 1.0 the function always returns unconditional test cases from
-    ``--test_cases_txt`` (one ``object_type`` per line, null caption emb).
-    """
+
+def _parse_cases(args: InferenceArgs, cfg_scale: float) -> Optional[List[CaseSpec]]:
+    """The test cases the arguments name, or None when the dataset's own split
+    is enumerated instead (cfg > 1 without a test-case file or prompts)."""
     if cfg_scale > 1.0:
         if args.test_cases_json is not None:
-            return _load_test_cases_json(
-                args.test_cases_json, config, dataset, device,
-                resolve_clip=resolve_clip,
-            )
-        return _load_test_cases_from_dataset(dataset)
-    return _load_test_cases_txt(args.test_cases_txt, config, dataset, device)
+            return _cases_from_json(args.test_cases_json, args.inbetween or args.motion_edit)
+        if args.prompt:
+            if args.motion_expand:
+                return [CaseSpec(ref=ref, tag=_slug(args.prompt[0]), prompt=list(args.prompt))
+                        for ref in args.asset]
+            return [CaseSpec(ref=ref, tag=_slug(p), prompt=p)
+                    for ref in args.asset for p in args.prompt]
+        return None
+    if args.test_cases_txt is not None:
+        with open(args.test_cases_txt) as f:
+            refs = [line.strip() for line in f
+                    if line.strip() and not line.lstrip().startswith('#')]
+        if not refs:
+            raise ValueError(f"No object types in {args.test_cases_txt}.")
+    else:
+        refs = list(args.asset)
+    return [CaseSpec(ref=ref, tag=None, prompt='') for ref in refs]
+
+
+def _resolve_cases(specs: List[CaseSpec], resolver: AssetResolver
+                   ) -> Tuple[List[CaseSpec], Dict[str, Asset]]:
+    """Resolve every case's asset. A case whose asset cannot be found is
+    skipped with a warning; two different assets sharing a name are an error
+    (object types and output files are keyed by it)."""
+    assets: Dict[str, Asset] = {}
+    resolved: Dict[str, Asset] = {}
+    kept, seen = [], set()
+    for spec in specs:
+        if spec.ref not in resolved:
+            try:
+                resolved[spec.ref] = resolver.resolve(spec.ref)
+            except (KeyError, ValueError) as exc:
+                logger.warning(f"Test case asset {spec.ref!r} skipped: {exc}")
+                resolved[spec.ref] = None
+        asset = resolved[spec.ref]
+        if asset is None:
+            continue
+        other = assets.get(asset.name)
+        if other is not None and other.source != asset.source:
+            raise ValueError(
+                f"Two assets named {asset.name!r} in one run ({other.source}, "
+                f"{asset.source}); sample them in separate runs (or rename a custom one "
+                f"with rig_preprocess --name).")
+        assets[asset.name] = asset
+        spec.asset = asset
+        if spec.case_id in seen:
+            base, n = spec.tag or 'case', 2
+            while f'{asset.name}-{base}_{n}' in seen:
+                n += 1
+            logger.warning(f"Test case id {spec.case_id!r} repeats; this one becomes "
+                           f"'{asset.name}-{base}_{n}'.")
+            spec.tag = f'{base}_{n}'
+        seen.add(spec.case_id)
+        kept.append(spec)
+    if not kept:
+        raise ValueError("No test case names a usable asset (see the warnings above).")
+    return kept, assets
+
+
+def _register_assets(dataset, assets: Dict[str, Asset], specs: List[CaseSpec],
+                     needs_gt: bool, config: MainConfig,
+                     cache_dirs: Tuple[str, ...] = ()) -> Dict[str, Asset]:
+    """Add the assets to a :class:`SkeletonDataset` (with the clips the cases
+    pin when *needs_gt*). Joint names come from the feature directories'
+    caches (*cache_dirs*: the run's, where present) before any is encoded.
+    Returns the assets that registered; one the model cannot take (too many
+    joints, not a canonical cond) is dropped with a warning."""
+    md = dataset.motion_dataset
+    md.merge_joint_name_cache(sorted({a.joint_cache_dir for a in assets.values()
+                                      if a.joint_cache_dir} | set(cache_dirs)))
+    clip_ids: Dict[str, set] = {}
+    for spec in specs:
+        if spec.clip:
+            clip_ids.setdefault(spec.asset.name, set()).add(spec.clip)
+    lo = config.dataset.min_joints
+    usable = {}
+    for name, asset in assets.items():
+        n_joints = len(asset.cond['parents'])
+        if n_joints < lo:
+            logger.warning(f"{name!r} has {n_joints} joints, fewer than the {lo} the run "
+                           f"trained on; expect weaker motion.")
+        clip_files = asset.clip_files(clip_ids.get(name, ())) if needs_gt else ()
+        try:
+            md.add_cond_object(name, asset.cond, asset.stats_dataset,
+                               motion_dir=asset.motion_dir, clip_files=clip_files,
+                               clip_key_prefix=asset.clip_key_prefix)
+        except ValueError as exc:
+            logger.warning(f"Asset {asset.source} not usable: {exc}")
+            continue
+        usable[name] = asset
+    if not usable:
+        raise ValueError("None of the test cases' assets can be sampled (see the warnings above).")
+    return usable
+
+
+def _encode_cases(specs: List[CaseSpec], dataset, encoder, args: InferenceArgs,
+                  cfg_scale: float):
+    """``TestCase`` tuples (or, for ``--motion_expand``, ``(case_id,
+    object_type, prompts, encodings)``) for the cases whose asset registered."""
+    md = dataset.motion_dataset
+    needs_gt = args.inbetween or args.motion_edit
+    cases = []
+    null_enc = None
+    for spec in specs:
+        name = spec.asset.name
+        if name not in md.cond_dict:
+            continue
+        if cfg_scale == 1.0:
+            if null_enc is None:
+                null_enc = _encode_prompt(encoder, "")
+            cases.append((spec.case_id, name, "", null_enc, None))
+            continue
+        if args.motion_expand:
+            prompts = spec.prompt
+            if not isinstance(prompts, list):
+                logger.warning(f"Test case {spec.case_id!r}: --motion_expand needs a list "
+                               f"of prompts, got {type(prompts).__name__}; skipping.")
+                continue
+            valid = [p.strip() for p in prompts if isinstance(p, str) and p.strip()]
+            if len(valid) != len(prompts):
+                logger.warning(f"Test case {spec.case_id!r}: {len(prompts) - len(valid)} "
+                               f"prompt(s) empty or non-string; keeping {len(valid)}.")
+            if not valid:
+                continue
+            cases.append((spec.case_id, name, valid,
+                          [_encode_prompt(encoder, p) for p in valid]))
+            continue
+        prompt = spec.prompt
+        if not isinstance(prompt, str):
+            logger.warning(f"Test case {spec.case_id!r}: expected a prompt string, got "
+                           f"{type(prompt).__name__} (prompt lists are for "
+                           f"--motion_expand); skipping.")
+            continue
+        if not prompt.strip():
+            # At cfg > 1 an empty prompt collapses to unconditional output,
+            # almost always a data-entry mistake.
+            logger.warning(f"Test case {spec.case_id!r}: empty prompt; skipping.")
+            continue
+        clip_name = None
+        if needs_gt:
+            if not spec.clip:
+                logger.warning(f"Test case {spec.case_id!r}: in-betweening / motion editing "
+                               f"need a clip id; skipping.")
+                continue
+            clip_name = _resolve_clip_name(dataset, name, spec.clip)
+            if clip_name not in md.cond_object_clips.get(name, ()):
+                clip_name = None            # the rest-pose reference is no ground truth
+            if clip_name is None:
+                where = spec.asset.motion_dir or 'none (a rig_preprocess output keeps its ' \
+                                                 'clips with --save_clips)'
+                logger.warning(f"Test case {spec.case_id!r}: no clip file of {name!r} matches "
+                               f"{spec.clip!r} (clip directory: {where}); skipping.")
+                continue
+        cases.append((spec.case_id, name, prompt, _encode_prompt(encoder, prompt), clip_name))
+    if not cases:
+        raise ValueError("No usable test cases (see the warnings above).")
+    logger.info(f"Prepared {len(cases)} test case(s) on {len({c[1] for c in cases})} asset(s).")
+    return cases
+
+
+class SampleManifest:
+    """``<output_dir>/manifest.json``: for every saved motion, the asset it
+    was generated for (cond file and key, joint order, canonical GLB, stats
+    dataset), its prompt and the run that made it. Mesh driving
+    (``scripts/run_animate_motion.sh <output_dir>``) reads it instead of being
+    told the dataset, cond and character again.
+
+    A run into a directory that already holds a manifest adds to it: earlier
+    motions stay drivable. An earlier asset of the same name that differs
+    (another cond, another joint order) loses its motions from the manifest,
+    since their files may be overwritten by this run's. Rewritten after every
+    chunk.
+    """
+
+    FILE = 'manifest.json'
+    FORMAT = 'unimate-samples/1'
+    # What makes two manifest assets of one name the same skeleton.
+    IDENTITY = ('cond_path', 'cond_key', 'joint_names')
+
+    def __init__(self, output_dir: str, args: InferenceArgs, model_path: str,
+                 cfg_scale: float, mode: str, assets: Dict[str, Asset]):
+        self.path = os.path.join(output_dir, self.FILE)
+        self.data = {'format': self.FORMAT, 'motions_dir': 'motions', 'runs': [],
+                     'assets': {}, 'samples': {}}
+        if os.path.isfile(self.path):
+            try:
+                with open(self.path) as f:
+                    old = json.load(f)
+            except (OSError, ValueError):
+                old = {}
+            if old.get('format') == self.FORMAT:
+                self.data.update(runs=old.get('runs', []), assets=old.get('assets', {}),
+                                 samples=old.get('samples', {}))
+        for name, asset in sorted(assets.items()):
+            entry = asset.manifest_entry()
+            prev = self.data['assets'].get(name)
+            if prev is not None and any(prev.get(k) != entry[k] for k in self.IDENTITY):
+                dropped = [k for k, v in self.data['samples'].items() if v.get('asset') == name]
+                for k in dropped:
+                    del self.data['samples'][k]
+                logger.warning(f"{self.path}: asset {name!r} differs from the one earlier runs "
+                               f"sampled ({prev.get('source')}); their {len(dropped)} motion(s) "
+                               f"are no longer listed.")
+            self.data['assets'][name] = entry
+        self.run = len(self.data['runs'])
+        self.data['runs'].append({'exp_dir': args.exp_dir, 'checkpoint': model_path,
+                                  'cfg_scale': cfg_scale, 'seed': args.seed, 'mode': mode})
+
+    def add(self, npy_name: str, case_id: str, asset: str, prompt: str, kind: str = 'sample'):
+        self.data['samples'][npy_name] = {'asset': asset, 'case_id': case_id, 'prompt': prompt,
+                                          'kind': kind, 'run': self.run}
+
+    def save(self):
+        tmp = f'{self.path}.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(self.data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, self.path)
+
+
+def _resolve_stats_path(exp_dir: str) -> Optional[str]:
+    """Return path to ``dataset_stats.npy`` in ``exp_dir``, or ``None``."""
+    candidate = os.path.join(exp_dir, "dataset_stats.npy")
+    return candidate if os.path.isfile(candidate) else None
 
 
 # ---------------------------------------------------------------------------
@@ -610,28 +655,39 @@ def _validate_cfg_inputs(cfg_scale: float, args: InferenceArgs):
             "--motion_expand is mutually exclusive with --inbetween / --motion_edit."
         )
     if (args.inbetween or args.motion_edit) and cfg_scale <= 1.0:
-        # cfg==1.0 uses --test_cases_txt (no clip pinning), so there's no
-        # GT motion to clamp known frames/joints against.
+        # cfg==1.0 samples unconditionally from --test_cases_txt / --asset
+        # (no clip pinning), so there's no GT motion to clamp against.
         mode = '--inbetween' if args.inbetween else '--motion_edit'
         raise ValueError(
             f"{mode} requires cfg_scale > 1.0 so test cases come from "
             f"--test_cases_json or the dataset eval split (both pin a clip)."
         )
+    if args.prompt and args.test_cases_json is not None:
+        raise ValueError("Give --prompt or --test_cases_json, not both.")
+    if args.prompt and not args.asset:
+        raise ValueError("--prompt is sampled on the --asset assets; give at least one.")
+    if args.prompt and (args.inbetween or args.motion_edit):
+        raise ValueError("--inbetween / --motion_edit pin clips by id: give them in "
+                         "--test_cases_json.")
     if args.motion_expand and cfg_scale <= 1.0:
         raise ValueError(
-            "--motion_expand requires cfg_scale > 1.0 and a --test_cases_json "
-            "whose values are lists of prompts (one per segment)."
+            "--motion_expand requires cfg_scale > 1.0 and prompt lists (--test_cases_json) "
+            "or --asset with --prompt."
         )
-    if args.motion_expand and args.test_cases_json is None:
+    if args.motion_expand and args.test_cases_json is None and not args.prompt:
         raise ValueError(
-            "--motion_expand requires --test_cases_json with per-case prompt lists."
+            "--motion_expand requires --test_cases_json with per-case prompt lists, or "
+            "--asset with --prompt (the segments)."
         )
     if args.motion_edit and not args.keep_joints.strip():
         raise ValueError(
             "--motion_edit requires --keep_joints (comma-separated joint names)."
         )
     if cfg_scale > 1.0:
-        if args.test_cases_json is None:
+        if (args.cond_path or args.asset) and args.test_cases_json is None and not args.prompt:
+            raise ValueError("--asset / --cond_path at cfg_scale > 1.0 need --prompt or "
+                             "--test_cases_json naming what to sample.")
+        if args.test_cases_json is None and not args.prompt:
             logger.info(
                 f"cfg_scale={cfg_scale} > 1.0 with no --test_cases_json: "
                 f"enumerating the dataset's test split (per-clip if eval split "
@@ -643,10 +699,25 @@ def _validate_cfg_inputs(cfg_scale: float, args: InferenceArgs):
                 "test_objects.txt drives the eval split at data-loading time."
             )
     else:  # cfg_scale == 1.0
-        if args.test_cases_txt is None:
-            raise ValueError("cfg_scale=1.0 requires --test_cases_txt.")
+        if args.test_cases_txt is None and not args.asset:
+            raise ValueError("cfg_scale=1.0 requires --test_cases_txt or --asset.")
         if args.test_cases_json is not None:
             logger.warning("--test_cases_json ignored because cfg_scale == 1.0.")
+        if args.prompt:
+            logger.warning("--prompt ignored because cfg_scale == 1.0 (unconditional).")
+
+
+def _load_captions_map(path: str) -> Dict[str, str]:
+    """An earlier run's ``captions.json`` in the same output directory, so it
+    keeps listing that run's motions (as ``manifest.json`` does)."""
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _wrap_for_cfg(model, cfg_scale: float):
@@ -690,13 +761,14 @@ def _run_sampling(
     config: MainConfig,
     sample_model,
     dataset,
-    test_cases: List[TestCase],
+    cases: List[TestCase],
     diffusion,
     gen_diffusion,
     cfg_scale: float,
     device: torch.device,
     args: InferenceArgs,
     output_dir: str,
+    manifest: Optional['SampleManifest'] = None,
 ):
     """Generate ``num_repetitions`` samples per test case, in chunks of
     ``args.batch_size``. ``no_grad`` keeps the ODE rollout from accumulating
@@ -707,13 +779,30 @@ def _run_sampling(
     pinned clip_name). That GT plus a keep_mask are passed to
     ``generate_samples`` which routes to the replacement-style sampler.
     Each case's GT is also saved as ``<case_id>-gt.npy`` for side-by-side
-    rendering.
+    rendering. *manifest* records every saved motion.
     """
+    test_cases = cases
     # Only pin the reference clip when in-betweening or motion-editing (the
     # clip's GT motion is what the sampler clamps against). Other runs let
     # create_sample_condition pick a random clip of the same object_type,
     # since only the skeleton is needed.
     needs_gt = args.inbetween or args.motion_edit
+    if needs_gt and args.gt_start_frame:
+        # A pinned clip that ends before the start frame has no GT window.
+        md = dataset.motion_dataset
+        kept = []
+        for case in test_cases:
+            clip = case[4]
+            n = (md.train_motion_dict.get(clip) or md.eval_motion_dict[clip])['motion'].shape[0]
+            if n > args.gt_start_frame:
+                kept.append(case)
+            else:
+                logger.warning(f"Test case {case[0]!r}: clip {clip!r} has {n} frames, "
+                               f"none from --gt_start_frame={args.gt_start_frame}; skipping.")
+        if not kept:
+            raise ValueError(f"No test case has a clip longer than "
+                             f"--gt_start_frame={args.gt_start_frame}.")
+        test_cases = kept
     if needs_gt:
         test_case_captions = [
             (ot, cap, emb, clip) for _, ot, cap, emb, clip in test_cases
@@ -740,7 +829,7 @@ def _run_sampling(
     # values are the prompt used to condition each sample. Rewritten after
     # every chunk so a partial run still leaves a valid index on disk.
     captions_path = os.path.join(output_dir, 'captions.json')
-    captions_map: Dict[str, str] = {}
+    captions_map: Dict[str, str] = _load_captions_map(captions_path)
 
     logger.info(
         f"Starting sampling: {total} test cases × {args.num_repetitions} reps "
@@ -759,7 +848,9 @@ def _run_sampling(
                     config=config,
                     data=dataset,
                     test_case_captions=test_case_captions[chunk_start:chunk_end],
-                    gt_start_frame=args.gt_start_frame,
+                    # Only a pinned GT clip is cropped; a plain run's random
+                    # reference clip just supplies the skeleton.
+                    gt_start_frame=args.gt_start_frame if needs_gt else None,
                 )
                 cond = {
                     k: v.to(device) if torch.is_tensor(v) else v
@@ -925,9 +1016,18 @@ def _run_sampling(
 
                 for object_idx, case_id in enumerate(chunk_case_ids):
                     npy_name = f'{case_id}-rep_{rep_i}-{object_idx}.npy'
-                    captions_map[npy_name] = captions_text[chunk_start + object_idx]
+                    caption = captions_text[chunk_start + object_idx]
+                    captions_map[npy_name] = caption
+                    if manifest is not None:
+                        obj_type = test_cases[chunk_start + object_idx][1]
+                        manifest.add(npy_name, case_id, obj_type, caption)
+                        if needs_gt:
+                            manifest.add(f'{case_id}-gt_rep_{rep_i}-{object_idx}.npy',
+                                         case_id, obj_type, caption, kind='ground_truth')
                 with open(captions_path, 'w') as f:
                     json.dump(captions_map, f, indent=2, ensure_ascii=False)
+                if manifest is not None:
+                    manifest.save()
 
                 # Drop chunk-scoped tensors before the next batch so peak GPU
                 # memory tracks per-batch, not per-run, usage.
@@ -941,13 +1041,14 @@ def _run_expansion_sampling(
     config: MainConfig,
     sample_model,
     dataset,
-    expand_cases: List[Tuple[str, str, List[str], List[np.ndarray]]],
+    cases: List[Tuple[str, str, List[str], List[CaptionEnc]]],
     diffusion,
     gen_diffusion,
     cfg_scale: float,
     device: torch.device,
     args: InferenceArgs,
     output_dir: str,
+    manifest: Optional['SampleManifest'] = None,
 ):
     """Per-case chain generation: each case produces one concatenated motion
     of length ``max_T + (max_T - overlap) * (N - 1)``.
@@ -957,8 +1058,10 @@ def _run_expansion_sampling(
     once via ``create_sample_condition`` and the per-segment cond is built
     by swapping in the segment's pre-encoded ``caption_emb`` — ``caption_emb``
     is a fixed-shape ``(B, text_dim)`` tensor (see ``mixture_batch_collate``)
-    so the swap is a single tensor assignment.
+    so the swap is a single tensor assignment. *manifest* records every
+    saved motion.
     """
+    expand_cases = cases
     overlap = args.expand_overlap
     max_T = config.dataset.max_motion_length
     if overlap <= 0 or overlap >= max_T:
@@ -968,7 +1071,7 @@ def _run_expansion_sampling(
         )
 
     captions_path = os.path.join(output_dir, 'captions.json')
-    captions_map: Dict[str, str] = {}
+    captions_map: Dict[str, str] = _load_captions_map(captions_path)
 
     logger.info(
         f"Starting motion-expand sampling: {len(expand_cases)} case(s) × "
@@ -1062,6 +1165,9 @@ def _run_expansion_sampling(
                 captions_map[npy_name] = joined_caption
                 with open(captions_path, 'w') as f:
                     json.dump(captions_map, f, indent=2, ensure_ascii=False)
+                if manifest is not None:
+                    manifest.add(npy_name, case_id, obj_type, joined_caption)
+                    manifest.save()
 
                 del cond, cond_per_segment, chain
                 _release_gpu()
@@ -1070,6 +1176,65 @@ def _run_expansion_sampling(
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
+
+def _mode(args: InferenceArgs, cfg_scale: float) -> str:
+    if args.inbetween:
+        return 'inbetween'
+    if args.motion_edit:
+        return 'motion_edit'
+    if args.motion_expand:
+        return 'motion_expand'
+    return 'text' if cfg_scale > 1.0 else 'unconditional'
+
+
+def _prepare_cases(args: InferenceArgs, config: MainConfig, cfg_scale: float,
+                   stats_path: Optional[str], device: torch.device):
+    """``(dataset, cases, assets)``: the dataset sampling conditions on, the
+    encoded test cases (``TestCase`` tuples, or expansion cases) and the
+    assets they use (name -> :class:`Asset`)."""
+    needs_gt = args.inbetween or args.motion_edit
+    specs = _parse_cases(args, cfg_scale)
+    if specs is None:
+        # No test cases: enumerate the dataset's own split (all its clips).
+        if stats_path is None:
+            logger.warning(
+                f"No dataset_stats.npy in {args.exp_dir}: stats are recomputed from the "
+                f"loaded clips, which may not match training-time normalization.")
+        dataset = create_dataset(dataset_config=config.dataset, model_config=config.model,
+                                 inference=True, stats_path=stats_path)
+        cases = _load_test_cases_from_dataset(dataset)
+        md = dataset.motion_dataset
+        resolver = AssetResolver(config.dataset)
+        assets = {}
+        for _, name, _, _, clip in cases:
+            if name not in assets:
+                entry = md.train_motion_dict.get(clip) or md.eval_motion_dict[clip]
+                assets[name] = resolver.dataset_asset(entry['dataset_type'], name,
+                                                      md.cond_dict[name])
+        return dataset, cases, assets
+
+    if stats_path is None:
+        raise FileNotFoundError(
+            f"No dataset_stats.npy in {args.exp_dir}: sampling needs the run's "
+            f"normalization statistics.")
+    resolver = AssetResolver(config.dataset, assets=args.asset, cond_paths=args.cond_path,
+                             cond_dataset_type=args.cond_dataset_type)
+    specs, assets = _resolve_cases(specs, resolver)
+    dataset = create_skeleton_dataset(config.dataset, config.model, stats_path)
+    encoder = _make_text_encoder(config, device)
+    md = dataset.motion_dataset
+    md.text_encoder = encoder           # joint names not in a cache use it too
+    try:
+        run_dirs = tuple(d for d in (resolver.features_dir(cfg.type) for cfg in
+                                     config.dataset.data_configs.values()) if os.path.isdir(d))
+        assets = _register_assets(dataset, assets, specs, needs_gt, config, run_dirs)
+        cases = _encode_cases(specs, dataset, encoder, args, cfg_scale)
+    finally:
+        md.text_encoder = None
+        del encoder
+        _release_gpu()
+    return dataset, cases, {n: a for n, a in assets.items() if any(c[1] == n for c in cases)}
 
 
 def main(args: InferenceArgs):
@@ -1123,17 +1288,13 @@ def main(args: InferenceArgs):
         set_seed(args.seed)
         logger.info(f"Set random seed to [{args.seed}]")
 
-    target_object_types, target_clip_stems = _resolve_inference_scope(args)
+    device = torch.device(config.sampling.device)
     stats_path = _resolve_stats_path(args.exp_dir)
-
-    dataset = create_dataset(
-        dataset_config=config.dataset,
-        model_config=config.model,
-        inference=True,
-        target_object_types=target_object_types,
-        target_clip_stems=target_clip_stems,
-        stats_path=stats_path,
-    )
+    # Test cases are encoded before the diffusion model moves to the device,
+    # so the text encoder and the model don't coexist on the GPU.
+    dataset, cases, assets = _prepare_cases(args, config, cfg_scale, stats_path, device)
+    manifest = SampleManifest(output_dir, args, model_path, cfg_scale,
+                              _mode(args, cfg_scale), assets)
 
     logger.info("Creating model and diffusion...")
     model = create_model(
@@ -1145,56 +1306,27 @@ def main(args: InferenceArgs):
     logger.info(f"Loading checkpoints from [{model_path}]...")
     _load_checkpoint(model, model_path, config)
 
-    device = torch.device(config.sampling.device)
-
-    # Encode test cases before moving the diffusion model to device, so the
-    # text encoder and diffusion model don't coexist on GPU. Motion-expand
-    # has a distinct test-case structure (per-case prompt lists), so it
-    # uses its own loader + runner.
-    if args.motion_expand:
-        expand_cases = _load_expand_test_cases(
-            args.test_cases_json, config, dataset, device,
-        )
-        test_cases = None
-    else:
-        expand_cases = None
-        test_cases = _select_test_cases(
-            args, cfg_scale, config, dataset, device,
-            resolve_clip=args.inbetween or args.motion_edit,
-        )
-
     model.to(device)
     model.eval()
 
     logger.info(f"Using cfg_scale={cfg_scale}")
     sample_model = _wrap_for_cfg(model, cfg_scale)
 
-    if args.motion_expand:
-        _run_expansion_sampling(
-            config=config,
-            sample_model=sample_model,
-            dataset=dataset,
-            expand_cases=expand_cases,
-            diffusion=diffusion,
-            gen_diffusion=gen_diffusion,
-            cfg_scale=cfg_scale,
-            device=device,
-            args=args,
-            output_dir=output_dir,
-        )
-    else:
-        _run_sampling(
-            config=config,
-            sample_model=sample_model,
-            dataset=dataset,
-            test_cases=test_cases,
-            diffusion=diffusion,
-            gen_diffusion=gen_diffusion,
-            cfg_scale=cfg_scale,
-            device=device,
-            args=args,
-            output_dir=output_dir,
-        )
+    run = _run_expansion_sampling if args.motion_expand else _run_sampling
+    run(
+        config=config,
+        sample_model=sample_model,
+        dataset=dataset,
+        cases=cases,
+        diffusion=diffusion,
+        gen_diffusion=gen_diffusion,
+        cfg_scale=cfg_scale,
+        device=device,
+        args=args,
+        output_dir=output_dir,
+        manifest=manifest,
+    )
+    logger.info(f"Samples and {SampleManifest.FILE} in {output_dir}")
 
 
 if __name__ == "__main__":

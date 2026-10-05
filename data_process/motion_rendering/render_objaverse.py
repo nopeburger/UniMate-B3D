@@ -2,7 +2,8 @@
 
 For each GLB, discovers all pose actions and renders each one as
 ``{glb_stem}-{action}/v00{0..3}/*.png`` — the layout consumed by
-``vlm_caption/caption_motion.py``.
+``vlm_caption/caption_motion.py``. :mod:`render_general` reuses
+:func:`main` with the general dataset's file list and action discovery.
 
 Usage (plain python — EEVEE needs the pip ``bpy`` module's GPU context):
     python -m data_process.motion_rendering.render_objaverse \
@@ -18,6 +19,7 @@ import bpy  # noqa: F401 — fail fast when the bpy module is unavailable
 from loguru import logger
 
 from data_process.utils.blender_export import (
+    asset_names,
     discover_pose_actions,
     list_gltf_files,
     unique_clip_names,
@@ -75,9 +77,16 @@ def find_pending_stems(output_dir, gltf_stems, require_video=False):
     return pending
 
 
-def render_glb(glb_path, output_dir, args):
-    """Render multi-view frames for every pose action in one GLB/GLTF file."""
-    save_name = Path(glb_path).stem
+def render_glb(glb_path, output_dir, args, save_name, discover=None):
+    """Render multi-view frames for every pose action in one asset file.
+
+    Args:
+        save_name: Asset name / clip-folder prefix (``asset_name`` of the
+            file, as the exporter names it).
+        discover: ``armature -> (action_names, frame_ranges)``; must match
+            the exporter of the same dataset (default: every pose action,
+            :func:`discover_pose_actions`).
+    """
     if is_asset_render_skipped(output_dir, save_name):
         logger.info(f"Previously marked as no-render, skipping: {glb_path}")
         return
@@ -93,7 +102,10 @@ def render_glb(glb_path, output_dir, args):
     # Names are derived from the UNFILTERED action list so they match the
     # export stage, which applies no frame-count filter — deriving them from
     # a filtered subset would shift the collision suffixes out of step.
-    all_action_names, frame_ranges = discover_pose_actions()
+    if discover is None:
+        all_action_names, frame_ranges = discover_pose_actions()
+    else:
+        all_action_names, frame_ranges = discover(armature)
     clip_suffixes = unique_clip_names(all_action_names)
 
     action_names = [
@@ -139,13 +151,21 @@ def render_glb(glb_path, output_dir, args):
     mark_asset_render_done(output_dir, save_name, expected_dirs)
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Render multi-view frames for Objaverse GLB/GLTF animations (EEVEE).")
+def main(list_assets=list_gltf_files, discover=None,
+         description="Render multi-view frames for Objaverse GLB/GLTF animations (EEVEE)."):
+    """CLI entry point.
+
+    Args:
+        list_assets: ``data_dir -> [asset paths]``. Each asset renders under
+            its :func:`asset_name` (the stem for objaverse's hex ids).
+        discover: Action discovery passed to :func:`render_glb`.
+    """
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--data_dir", type=str, required=True,
-                        help="Directory containing GLB/GLTF files.")
+                        help="Directory containing the asset files.")
     parser.add_argument("--obj_name", type=str, default=None,
-                        help="Single GLB stem to render (default: all files).")
+                        help="Single asset name to render (the file stem with "
+                             "'-' and whitespace replaced by '_'; default: all files).")
     parser.add_argument("--output_dir", type=str, required=True,
                         help="Output directory.")
     parser.add_argument("--scale", type=float, default=1.0,
@@ -189,23 +209,24 @@ def main():
     init_render_engine(render_samples=args.samples)
 
     data_dir = Path(args.data_dir)
+    gltf_paths = list_assets(data_dir)
+    # Raises when two files share a name; checked before sharding so every
+    # worker agrees.
+    names = asset_names(gltf_paths)
     if args.obj_name:
-        glb_path = data_dir / f"{args.obj_name}.glb"
-        if not glb_path.is_file():
-            glb_path = data_dir / f"{args.obj_name}.gltf"
-        if not glb_path.is_file():
-            parser.error(f"Cannot find {args.obj_name}.glb or .gltf in {data_dir}")
-        gltf_paths = [glb_path]
+        gltf_paths = [p for p in gltf_paths if names[p] == args.obj_name]
+        if not gltf_paths:
+            parser.error(f"No asset named {args.obj_name!r} in {data_dir} "
+                         f"(or it is listed in excluded.csv)")
     else:
-        gltf_paths = list_gltf_files(data_dir)
-        logger.info(f"Found {len(gltf_paths)} GLB/GLTF files in {data_dir}")
+        logger.info(f"Found {len(gltf_paths)} asset files in {data_dir}")
 
     if args.missing_only:
-        pending = find_pending_stems(args.output_dir, [p.stem for p in gltf_paths],
+        pending = find_pending_stems(args.output_dir, [names[p] for p in gltf_paths],
                                      require_video=args.video)
         before = len(gltf_paths)
-        gltf_paths = [p for p in gltf_paths if p.stem in pending]
-        logger.info(f"[missing-only] {len(gltf_paths)}/{before} GLBs have pending renders.")
+        gltf_paths = [p for p in gltf_paths if names[p] in pending]
+        logger.info(f"[missing-only] {len(gltf_paths)}/{before} assets have pending renders.")
 
     if args.num_workers > 1:
         gltf_paths = gltf_paths[args.worker_id::args.num_workers]
@@ -219,7 +240,8 @@ def main():
     n_failed = 0
     for glb_path in gltf_paths:
         try:
-            render_glb(glb_path, args.output_dir, args)
+            render_glb(glb_path, args.output_dir, args,
+                       save_name=names[glb_path], discover=discover)
         except Exception as e:  # noqa: BLE001 — keep the batch going
             n_failed += 1
             logger.exception(f"Failed to render {glb_path}")

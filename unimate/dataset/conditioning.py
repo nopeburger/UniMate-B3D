@@ -181,6 +181,9 @@ def create_sample_condition(
         raw_motion = motion_data['motion']  # (F, J, D)
         parents = motion_data['parents']    # (J,)
         tpos = np.array(condition['tpos_first_frame'])
+        # Grounded like the training T-pose (Mixture._precompute_object_type_meta).
+        if config.dataset.ground_motion_height:
+            tpos[..., 1] -= tpos[..., 1].min()
 
         max_motion_length = config.dataset.max_motion_length
         raw_motion, start_idx = apply_cropping(
@@ -190,7 +193,7 @@ def create_sample_condition(
 
         # Re-align so frame-0 facing is identity (matches training-time
         # invariant assumed by the feature pipeline).
-        if start_idx > 0:
+        if config.dataset.realign_feature and start_idx > 0:
             raw_motion = realign_unimate_clip(raw_motion, parents)
 
         # Pad tpos (J, 3) to motion feature dim (J, 12): identity 6D

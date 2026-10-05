@@ -40,11 +40,16 @@ def import_fbx(path: str):
     bpy.ops.import_scene.fbx(filepath=path, use_anim=True)
 
 
+# Float noise on an action's frame range (60.0000038 for 60) must not add a
+# frame: an end within this of an integer rounds to it.
+FRAME_RANGE_EPS = 1e-3
+
+
 def action_frame_range(action):
     """Return (start, end) integer frame range for an action."""
     fr = action.frame_range
-    start = int(floor(fr[0]))
-    end = int(ceil(fr[1]))
+    start = int(floor(fr[0] + FRAME_RANGE_EPS))
+    end = int(ceil(fr[1] - FRAME_RANGE_EPS))
     return start, max(start, end)
 
 
@@ -101,8 +106,8 @@ def load_excluded_stems(input_dir: Path) -> set:
     return stems
 
 
-def list_gltf_files(input_dir: Path):
-    exts = {".glb", ".gltf"}
+def _list_files(input_dir: Path, exts):
+    input_dir = Path(input_dir)
     paths = sorted(p for p in input_dir.glob("*") if p.is_file() and p.suffix.lower() in exts)
     excluded = load_excluded_stems(input_dir)
     if not excluded:
@@ -111,6 +116,73 @@ def list_gltf_files(input_dir: Path):
     if len(kept) != len(paths):
         logger.info(f"Skipping {len(paths) - len(kept)} asset(s) listed in {EXCLUDED_CSV}")
     return kept
+
+
+def list_gltf_files(input_dir: Path):
+    """``.glb``/``.gltf`` files directly under *input_dir* (objaverse layout),
+    minus the stems listed in ``excluded.csv``."""
+    return _list_files(input_dir, {".glb", ".gltf"})
+
+
+# Formats of the ``general`` dataset (and of any export_general.py input):
+# the importer is picked per file by extension.
+GENERAL_ASSET_EXTS = frozenset({".glb", ".gltf", ".fbx"})
+
+
+def list_asset_files(input_dir: Path):
+    """``.glb``/``.gltf``/``.fbx`` files directly under *input_dir*, minus the
+    stems listed in ``excluded.csv``. The asset list of the ``general``
+    dataset: its exporter and renderer must see the same files."""
+    return _list_files(input_dir, GENERAL_ASSET_EXTS)
+
+
+def strip_gltf_action_suffix(armature):
+    """Rename the armature's actions back to their glTF animation names.
+
+    Blender's glTF importer names the action of animation ``walk`` on node
+    ``Armature`` ``walk_Armature``. A multi-animation GLB (one asset, its
+    clips as named animations) would otherwise export ``{asset}-walk_Armature``.
+    An action keeps its name when the stripped name is empty or already taken.
+    """
+    if armature is None:
+        return
+    suffix = f"_{armature.name}"
+    owned = set()
+    anim_data = armature.animation_data
+    if anim_data is not None:
+        if anim_data.action is not None:
+            owned.add(anim_data.action)
+        owned.update(s.action for t in anim_data.nla_tracks for s in t.strips
+                     if s.action is not None)
+    for action in sorted(owned, key=lambda a: a.name):
+        base = action.name[:-len(suffix)] if action.name.endswith(suffix) else ''
+        if base and base not in bpy.data.actions:
+            action.name = base
+
+
+def discover_clip_actions(armature):
+    """Pose actions of the loaded scene (:func:`discover_pose_actions`), or,
+    when the pose filter finds none, the armature's bound action (single-action
+    files such as Mixamo animation-only FBX). The armature's actions are first
+    renamed to their glTF animation names (:func:`strip_gltf_action_suffix`).
+
+    The ``general`` exporter and renderer both call this, so they derive the
+    same clip names; the objaverse pair has neither the renaming nor the
+    fallback.
+
+    Returns:
+        ``(action_names, frame_ranges)`` like :func:`discover_pose_actions`.
+    """
+    strip_gltf_action_suffix(armature)
+    action_names, frame_ranges = discover_pose_actions()
+    if action_names or armature is None:
+        return action_names, frame_ranges
+    anim_data = armature.animation_data
+    if anim_data is None or anim_data.action is None:
+        return action_names, frame_ranges
+    action = anim_data.action
+    logger.info(f"No pose actions discovered; falling back to bound action '{action.name}'.")
+    return [action.name], {action.name: action_frame_range(action)}
 
 
 def action_is_relevant_pose(action) -> bool:
@@ -170,6 +242,41 @@ def sanitize_object_type(obj_type):
     clip names (e.g. 'Dog_2-Walk').
     """
     return obj_type.replace('-', '_').replace(' ', '_')
+
+
+def asset_name(path):
+    """Object-type name of one asset file: its stem with ``-`` and every
+    whitespace character replaced by ``_``.
+
+    Clips are named ``{asset}-{action}`` and every later stage takes the
+    object type as the text before the first ``-``, so a stem like
+    ``my-robot`` must become ``my_robot``. Objaverse stems (hex ids) and the
+    Mixamo character names are unchanged by it.
+    """
+    return re.sub(r'[-\s]', '_', Path(path).stem)
+
+
+def asset_names(paths):
+    """``{path: asset_name(path)}`` for a list of asset files.
+
+    Raises:
+        ValueError: when two files map to the same name (``a-b.glb`` and
+            ``a_b.glb``, or ``x.glb`` and ``x.fbx``); they would export and
+            render into one object type, the second silently skipped as
+            already done.
+    """
+    names = {}
+    by_name = {}
+    for p in paths:
+        name = asset_name(p)
+        by_name.setdefault(name, []).append(Path(p).name)
+        names[p] = name
+    clashes = {n: files for n, files in by_name.items() if len(files) > 1}
+    if clashes:
+        detail = '; '.join(f"{n}: {', '.join(files)}" for n, files in sorted(clashes.items()))
+        raise ValueError(f"{len(clashes)} asset name(s) are shared by several files "
+                         f"(rename them): {detail}")
+    return names
 
 
 def sanitize_action_name(raw_name):
@@ -234,7 +341,8 @@ def unique_clip_names(action_names):
     the render under one clip name end up being different animations and the
     caption describes the wrong motion.
 
-    Colliding names get a ``_00``/``_01``… suffix in list order. Callers on
+    Colliding names get a ``_00``/``_01``… suffix in list order, skipping any
+    that another action's name already takes. Callers on
     both sides must pass the SAME ordered action list (the full set of pose
     actions, before any frame-count filtering) or the suffixes diverge.
 
@@ -250,6 +358,10 @@ def unique_clip_names(action_names):
     for base in bases:
         total[base] = total.get(base, 0) + 1
 
+    # A suffixed name must not land on a name another action already has
+    # (``Take_001_00`` from ``Take 001|A`` next to an action named
+    # ``Take_001_00``): skip to the next free index.
+    used = {base for base in bases if total[base] == 1}
     seen = {}
     mapping = {}
     for action_name, base in zip(action_names, bases):
@@ -257,8 +369,11 @@ def unique_clip_names(action_names):
             mapping[action_name] = base
         else:
             idx = seen.get(base, 0)
+            while f"{base}_{idx:02d}" in used:
+                idx += 1
             seen[base] = idx + 1
             mapping[action_name] = f"{base}_{idx:02d}"
+            used.add(mapping[action_name])
     return mapping
 
 
@@ -267,6 +382,13 @@ def unique_clip_names(action_names):
 # ─────────────────────────────────────────────────────────────────────────────
 
 _SKINNING_WEIGHT_EPS = 1e-5
+
+
+def _max_weight(skin_matrix, j):
+    """Largest weight of bone *j* over the vertices; 0 without a mesh
+    (a ``(0, nbones)`` skin matrix)."""
+    return float(skin_matrix[:, j].max()) if len(skin_matrix) else 0.0
+
 
 _CONTROL_PREFIXES = ('MCH-', 'ORG-', 'VIS-')
 _CONTROL_SUFFIXES_LOWER = (
@@ -309,6 +431,14 @@ def choose_main_mesh(meshes):
     if not meshes:
         return None
     return sorted(meshes, key=lambda m: len(m.data.vertices), reverse=True)[0]
+
+
+def find_skinned_meshes(armature):
+    """Meshes deformed by *armature* (an Armature modifier targeting it), in
+    scene order. A rig built from one mesh per part (robots) skins each part
+    to its own bone, so the main mesh alone leaves most bones unskinned."""
+    return [m for m in find_meshes()
+            if any(md.type == 'ARMATURE' and md.object == armature for md in m.modifiers)]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -519,14 +649,16 @@ def collapse_unused_root(anim: Animation):
 def _is_prunable(j, skin_matrix, anims_list, rest_anim, names,
                  offset_eps, pos_var_eps, rot_eps,
                  mean_bone_len=1.0, is_leaf=True,
-                 consider_parent_rotate=True):
+                 consider_parent_rotate=True, end_effector_suffixes=()):
     """
     Return True if bone j should be removed from the skeleton.
     Works with one or more animation clips for aggregated decisions.
 
     Conditions (checked in order, first match wins):
 
-      (0) Name convention   — Blender control/mechanism prefix or suffix.
+      (0) Name convention   — Blender control/mechanism prefix or suffix,
+                              except a leaf ending in one of
+                              *end_effector_suffixes*, which (4) decides.
       (1) Near-zero offset  — bone head coincident with parent in rest pose.
       (2) Near-zero position— bone stays at parent origin in ALL clips.
       (3) Non-rigid (leaf)  — bone length varies from rest in ANY clip;
@@ -540,10 +672,11 @@ def _is_prunable(j, skin_matrix, anims_list, rest_anim, names,
     Distance conditions are normalized by mean_bone_len (scale-agnostic).
     """
     # Skinned bones are never prunable
-    if skin_matrix[:, j].max() >= _SKINNING_WEIGHT_EPS:
+    if _max_weight(skin_matrix, j) >= _SKINNING_WEIGHT_EPS:
         return False
 
-    if name_is_control_bone(names[j]):                                    # (0)
+    if name_is_control_bone(names[j]) and not (                           # (0)
+            is_leaf and names[j].lower().endswith(tuple(end_effector_suffixes))):
         return True
 
     norm = max(mean_bone_len, 1e-9)
@@ -661,7 +794,7 @@ def _find_root(parents):
 
 def _pass_prune_leaves(anims_list, rest_anim, names, skin_matrix,
                        offset_eps, pos_var_eps, rot_eps, min_joints,
-                       consider_parent_rotate=True):
+                       consider_parent_rotate=True, end_effector_suffixes=()):
     """Pass 1: iteratively remove prunable leaf bones."""
     count = 0
     mbl = _compute_mean_bone_len(rest_anim)
@@ -673,7 +806,8 @@ def _pass_prune_leaves(anims_list, rest_anim, names, skin_matrix,
                       and _is_prunable(j, skin_matrix, anims_list, rest_anim, names,
                                        offset_eps, pos_var_eps, rot_eps,
                                        mean_bone_len=mbl, is_leaf=True,
-                                       consider_parent_rotate=consider_parent_rotate)]
+                                       consider_parent_rotate=consider_parent_rotate,
+                                       end_effector_suffixes=end_effector_suffixes)]
         if not candidates:
             break
         keep = [j for j in range(n_joints) if j not in set(candidates)]
@@ -695,7 +829,7 @@ def _pass_promote_root(anims_list, rest_anim, names, skin_matrix):
         root_idx = _find_root(anims_list[0].parents)
         children = children_from_parents(anims_list[0].parents)[root_idx]
         if not (len(children) == 1
-                and skin_matrix[:, root_idx].max() < _SKINNING_WEIGHT_EPS):
+                and _max_weight(skin_matrix, root_idx) < _SKINNING_WEIGHT_EPS):
             break
         logger.info(f"Promoting root child (removing '{names[root_idx]}')")
         new_anims = []
@@ -747,7 +881,7 @@ def _pass_merge_passthrough(anims_list, rest_anim, names, skin_matrix,
 def prune_skeleton_shared(anims_list, rest_anim, names, skin_matrix,
                           offset_eps=1e-3, pos_var_eps=1e-3,
                           rot_eps=np.deg2rad(2.0), min_joints=4,
-                          consider_parent_rotate=True):
+                          consider_parent_rotate=True, end_effector_suffixes=()):
     """Iterative skeleton pruning across multiple animation clips.
 
     Guarantees identical topology across all clips.  Three passes per
@@ -762,6 +896,9 @@ def prune_skeleton_shared(anims_list, rest_anim, names, skin_matrix,
             rotate are preserved when their parent rotates — treating them
             as meaningful end-effectors (e.g. spider toe tips). If False,
             such leaves are pruned regardless of parent motion.
+        end_effector_suffixes: Lowercase name suffixes (e.g. ``('_tip',)``)
+            that mark a leaf as an end effector rather than a control bone,
+            so the name rule does not prune it.
     """
     stats = {"leaf": 0, "root_promoted": 0, "passthrough": 0}
 
@@ -769,7 +906,8 @@ def prune_skeleton_shared(anims_list, rest_anim, names, skin_matrix,
         anims_list, rest_anim, names, skin_matrix, n_leaf = \
             _pass_prune_leaves(anims_list, rest_anim, names, skin_matrix,
                                offset_eps, pos_var_eps, rot_eps, min_joints,
-                               consider_parent_rotate=consider_parent_rotate)
+                               consider_parent_rotate=consider_parent_rotate,
+                               end_effector_suffixes=end_effector_suffixes)
 
         anims_list, rest_anim, names, skin_matrix, n_root = \
             _pass_promote_root(anims_list, rest_anim, names, skin_matrix)
@@ -911,19 +1049,24 @@ def extract_animation_frames(armature, start_frame, end_frame, nbones, dtype=np.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_bone_weight_sums(mesh, armature):
-    """Sum skin weights per bone across all vertices."""
-    vg_to_bone = build_vgroup_to_bone_mapping(mesh, armature)
+    """Sum skin weights per bone across all vertices of *mesh* (one mesh or a
+    list of meshes)."""
     weight_sums = {bname: 0.0 for bname in armature.data.bones.keys()}
-    for v in mesh.data.vertices:
-        for g in v.groups:
-            bname = vg_to_bone.get(g.group)
-            if bname:
-                weight_sums[bname] += g.weight
+    for m in (mesh if isinstance(mesh, (list, tuple)) else [mesh]):
+        vg_to_bone = build_vgroup_to_bone_mapping(m, armature)
+        for v in m.data.vertices:
+            for g in v.groups:
+                bname = vg_to_bone.get(g.group)
+                if bname:
+                    weight_sums[bname] += g.weight
     return weight_sums
 
 
 def build_skeleton_arrays(armature, mesh, dtype=np.float64, apply_world=True):
     """Extract skeleton topology, rest pose, and skin matrix from Blender objects.
+
+    *mesh* is one mesh, a list of meshes (their skin matrices are stacked,
+    rows in list order) or None.
 
     Returns:
         bone_names, parents_array, rest_local_pos, rest_local_rot, skin_matrix
@@ -932,11 +1075,14 @@ def build_skeleton_arrays(armature, mesh, dtype=np.float64, apply_world=True):
     bone_names = list(bones.keys())
     bone_name_to_index = {b.name: i for i, b in enumerate(bones)}
 
-    if mesh is None:
+    meshes = [] if mesh is None else (list(mesh) if isinstance(mesh, (list, tuple)) else [mesh])
+    if not meshes:
         skin_matrix = np.zeros((0, len(bone_names)), dtype=dtype)
     else:
-        vg_to_bone = build_vgroup_to_bone_mapping(mesh, armature)
-        _, skin_matrix = build_vertex_groups_sparse(mesh, vg_to_bone, bone_name_to_index)
+        skin_matrix = np.concatenate([
+            build_vertex_groups_sparse(m, build_vgroup_to_bone_mapping(m, armature),
+                                       bone_name_to_index)[1]
+            for m in meshes], axis=0)
 
     parents_array = np.array([
         -1 if bone.parent is None else bones.find(bone.parent.name)
@@ -1014,6 +1160,8 @@ def prepare_skeleton(armature, mesh=None, dtype=np.float64, apply_world=True):
 
     When *mesh* is None (e.g. Mixamo clips without a character mesh), the
     secondary-root prune step is skipped and skin_matrix is returned empty.
+    A list of meshes gives the skin weights of all of them
+    (:func:`build_skeleton_arrays`).
 
     Returns a dict with keys: nbones, bone_names, parents_array,
     rest_local_pos, rest_local_rot, skin_matrix, rest_anim, rest_anim_shared.
@@ -1113,19 +1261,29 @@ def save_motion(motion_path, vis_path, anim, rest_anim, names, skin_matrix, fps,
         )
         logger.info(f"Saved visualization: {vis_path}")
 
-    np.savez(
-        motion_path,
-        rest_local_pos=rest_anim.positions[0],
-        rest_local_rot=rest_anim.rotations[0].qs,
-        anim_local_pos=anim.positions,
-        anim_local_rot=anim.rotations.qs,
-        offsets=anim.offsets,
-        names=np.array(names),
-        skin_matrix=skin_matrix,
-        fps=fps,
-        parents=anim.parents,
-        action_name=action_name,
-    )
+    # Written beside the target and renamed into place, so an interrupted run
+    # never leaves a truncated NPZ that a resumed run would take as done.
+    tmp_path = f"{motion_path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp_path, 'wb') as f:
+            np.savez(
+                f,
+                rest_local_pos=rest_anim.positions[0],
+                rest_local_rot=rest_anim.rotations[0].qs,
+                anim_local_pos=anim.positions,
+                anim_local_rot=anim.rotations.qs,
+                offsets=anim.offsets,
+                names=np.array(names),
+                skin_matrix=skin_matrix,
+                fps=fps,
+                parents=anim.parents,
+                action_name=action_name,
+            )
+        os.replace(tmp_path, motion_path)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
     logger.info(f"Saved motion data: {motion_path}")
 
 

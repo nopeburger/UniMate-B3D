@@ -14,14 +14,14 @@
 #   CONDA_ENV             conda environment to activate (default: unimate)
 #   CUDA_VISIBLE_DEVICES  GPU to use (default: the one with the most free memory)
 #
-# For multi-GPU runs use scripts/slurm/slurm_train.sh instead.
+# Multi-GPU: accelerate launch --num_processes <N> -m unimate.training.train --config <config>
 
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 handle_help "$@"
 
-CONFIG=${1:-configs/uniml3d_60frames_graph_adaln.json}
-shift || true
+CONFIG=configs/uniml3d_60frames_graph_adaln.json
+if [[ $# -gt 0 && "$1" != "--" ]]; then CONFIG=$1; shift; fi
 [[ "${1:-}" == "--" ]] && shift
 
 [[ -f "$CONFIG" ]] || { echo "No such config: $CONFIG" >&2; exit 1; }
@@ -30,7 +30,7 @@ select_gpu
 echo "Config:     $CONFIG"
 echo "Output dir: ${OUTPUT_DIR:-<config default>}"
 
-CMD=(accelerate launch -m unimate.training.train --config "$CONFIG")
+CMD=(accelerate launch --num_processes 1 -m unimate.training.train --config "$CONFIG")
 [[ -n "${OUTPUT_DIR:-}" ]] && CMD+=(--output_dir "$OUTPUT_DIR")
 
 "${CMD[@]}" "$@"

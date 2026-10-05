@@ -23,12 +23,16 @@ from unimate.utils.topology_utils import (
     compute_edge_indexs,
     compute_laplacian_eigenvectors,
 )
-from unimate.utils.rotation_conversions import rotation_6d_to_matrix_np
+from unimate.utils.rotation_conversions import matrix_to_quaternion_np, rotation_6d_to_matrix_np
 from unimate.utils.motion_utils import (
     compute_rifke,
+    compute_local_velocity,
     hml_rotations_to_bvh_quaternions,
     fk_global_positions,
 )
+
+# Identity rotation in the 6-D layout the features use.
+_IDENTITY_6D = Quaternions.id(1).rotation_matrix(cont6d=True)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -74,14 +78,25 @@ def collapse_single_child_joint(aug, j, c, p):
     """Collapse a single-child interior joint *j* into its child *c*.
 
     Merges offsets and rotation channels, then re-parents *c* to grandparent
-    *p*. In the HML layout, joint k's slot stores ``bvh[parents[k]]``: after
-    collapse, c's parent becomes p, so ``motion[c, 3:9]`` must hold
-    ``bvh[p]`` — which is exactly what ``motion[j, 3:9]`` stored pre-collapse.
-    Grandchildren's slots hold ``bvh[c]`` which must remain ``bvh[c]_old``
-    for FK below c to be preserved, so they are left untouched. Offsets are
-    summed in the rest frame (identity rest rotations).
+    *p*. In the HML layout, joint k's slot stores the LOCAL rotation
+    ``bvh[parents[k]]``: after collapse, c's parent becomes p, so
+    ``motion[c, 3:9]`` must hold ``bvh[p]``, which is what ``motion[j, 3:9]``
+    stored pre-collapse. j's own local rotation ``L_j`` (stored in c's slot)
+    is folded into c's (stored in the slots of c's children) as
+    ``L_j @ L_c``, so every global rotation from c down is preserved.
+    Offsets are summed in the rest frame (identity rest rotations).
+
+    Positions are preserved only where ``L_j`` is identity: c lands at
+    ``p_world + G_p·(offset_j + offset_c)`` instead of
+    ``p_world + G_p·offset_j + G_p·L_j·offset_c``, and its subtree shifts
+    rigidly with it, because one straight bone cannot bend.
     """
-    aug['motion'][:, c, 3:9] = aug['motion'][:, j, 3:9]
+    motion = aug['motion']
+    L_j = rotation_6d_to_matrix_np(motion[:, c, 3:9])                 # (T, 3, 3)
+    for k in np.flatnonzero(aug['parents'] == c):
+        L_c = rotation_6d_to_matrix_np(motion[:, k, 3:9])
+        motion[:, k, 3:9] = Quaternions(matrix_to_quaternion_np(L_j @ L_c)).rotation_matrix(cont6d=True)
+    motion[:, c, 3:9] = motion[:, j, 3:9]
     aug['offsets'][c] = aug['offsets'][j] + aug['offsets'][c]
     aug['parents'][c] = p
 
@@ -110,19 +125,46 @@ def _augmented_global_positions(aug):
 
 
 def recompute_position_features(aug):
-    """Recompute RIFKE position features (0:3) for non-root joints via FK.
+    """Recompute the position-derived features of non-root joints via FK:
+    RIFKE positions (0:3) and local velocities (9:12).
 
     Re-runs the same FK pipeline used at data-processing time
-    (``positions_global`` + ``compute_rifke``) so the augmented clip is
-    consistent with the feature-extraction convention.
+    (``positions_global`` + ``compute_rifke`` / ``compute_local_velocity``)
+    so the augmented clip is consistent with the feature-extraction
+    convention. The root's channels are untouched: every op keeps the root.
     """
     global_positions = _augmented_global_positions(aug)
-    root_facing_quat = Quaternions.from_transforms(
+    root_facing_quat = Quaternions(matrix_to_quaternion_np(
         rotation_6d_to_matrix_np(aug['motion'][:, 0, 3:9])
-    )
+    ))
     rifke = compute_rifke(global_positions, root_facing_quat)
     # Root RIFKE channels [0, Y, 0] are invariant to offset changes.
     aug['motion'][:, 1:, :3] = rifke[:, 1:]
+    _recompute_velocity_features(aug, global_positions, root_facing_quat)
+
+
+def _recompute_velocity_features(aug, global_positions, root_facing_quat):
+    """Rewrite the local velocities (9:12) of non-root joints in place.
+
+    ``global_positions`` come from FK with the root pinned at XZ = 0, which
+    drops the root's planar translation. Velocity is linear in position and
+    every joint shares that translation, so its contribution is one vector
+    per frame: the root's stored velocity minus the root's pinned velocity.
+
+    Feature frame t holds the step t -> t+1, and the last feature frame's
+    successor is not stored. That frame keeps its old value plus the change
+    measured one frame earlier, which leaves joints the op did not move
+    unchanged up to rounding and extrapolates the others (and a new joint's
+    all-zero placeholder) by one frame.
+    """
+    motion = aug['motion']
+    if motion.shape[0] < 2:
+        return
+    vel = compute_local_velocity(global_positions, root_facing_quat)  # (T-1, J, 3)
+    vel = vel + (motion[:-1, 0, 9:12] - vel[:, 0])[:, None]
+    old = motion[:, 1:, 9:12].copy()
+    motion[:-1, 1:, 9:12] = vel[:, 1:]
+    motion[-1, 1:, 9:12] = old[-1] + (vel[-1, 1:] - old[-2])
 
 
 def recompute_tpos_positions(aug):
@@ -230,17 +272,18 @@ def apply_joint_addition_linear(aug, max_freqs, max_path_len=5.):
     offset_new = offsets[ji] * alpha
     offset_ji_rem = offsets[ji] * (1 - alpha)
 
-    # HML: the new joint's slot stores bvh[parents[new]] = bvh[pi],
-    # which is exactly what old motion[ji, 3:9] already holds. With
-    # identity local rotation at the new joint, bvh[new] = bvh[pi],
-    # so after concat motion[ji+1, 3:9] (old-ji's shifted slot, which
-    # must store bvh[new]) is already correct — leave it unchanged.
+    # HML: slot k stores the LOCAL rotation of parents[k]. The new joint's
+    # slot therefore stores bvh[pi], which old motion[ji, 3:9] already holds.
+    # Old ji (now at ji+1) must store bvh[new], the new joint's local
+    # rotation, which is identity; keeping bvh[pi] there would apply pi's
+    # rotation twice and rotate ji's whole subtree.
     new_motion = np.zeros((n_frames, 1, D), dtype=motion.dtype)
     new_motion[:, 0, 3:9] = motion[:, ji, 3:9]
 
     aug['motion'] = np.concatenate(
         [motion[:, :ji], new_motion, motion[:, ji:]], axis=1,
     )
+    aug['motion'][:, ji + 1, 3:9] = _IDENTITY_6D
     aug['offsets'] = np.concatenate(
         [offsets[:ji], offset_new[None], offsets[ji:]], axis=0,
     )
@@ -320,16 +363,14 @@ def apply_joint_addition_ellipsoid(aug, max_freqs,
     sample inside a bone-aligned ellipsoid with Gaussian falloff.
 
     FK preservation: the rest skeleton shape is the running sum of
-    ``offsets`` (identity rest rotations), so all offsets stay in the rest
-    frame (``offset_ji_rem = d_rem_parent``) and the rest-pose position of
-    every node in ji's subtree is preserved. At every frame,
-    ``pi_world + bvh[pi]·offsets[ji]
-    = pi_world + bvh[pi]·offset_new + bvh[new]·offset_ji_rem`` requires
-    ``bvh[new]·d_rem_parent = bvh[pi]·d_rem_parent``; choosing identity
-    local rotation at the new joint satisfies this exactly and leaves every
-    global rotation in the subtree unchanged — so neither ji's HML slot
-    (now at ji+1, storing ``bvh[new] = bvh[pi]``, already the pre-existing
-    value) nor any descendant slot needs to be modified.
+    ``offsets`` (identity rest rotations), so ``offset_new + offset_ji_rem =
+    offsets[ji]`` keeps the rest pose of ji's subtree. ``bvh`` rotations are
+    local, so with ``G`` the global rotation of pi, ji sits at
+    ``pi_world + G·offset_new + G·L_new·offset_ji_rem``, which equals the
+    original ``pi_world + G·offsets[ji]`` exactly when the new joint's local
+    rotation ``L_new`` is identity. That identity goes into old ji's slot
+    (now ji+1, which stores ``bvh[new]``); the new joint's own slot takes
+    ``bvh[pi]`` from old ji's slot, and every other slot is unchanged.
     """
     motion = aug['motion']
     parents = aug['parents']
@@ -361,6 +402,7 @@ def apply_joint_addition_ellipsoid(aug, max_freqs,
     aug['motion'] = np.concatenate(
         [motion[:, :ji], new_motion, motion[:, ji:]], axis=1,
     )
+    aug['motion'][:, ji + 1, 3:9] = _IDENTITY_6D   # bvh[new]: identity local
     aug['offsets'] = np.concatenate(
         [offsets[:ji], offset_new[None], offsets[ji:]], axis=0,
     )
@@ -396,7 +438,9 @@ def apply_skeleton_pooling(aug, pool_rate, max_freqs):
 
     Teaches the model that skeletons differing only in linear-chain length
     are topologically equivalent. Rotation slots are re-wired into the
-    child and offsets are merged so the FK chain is preserved.
+    child and offsets are merged; global rotations below each collapsed
+    joint are preserved, positions only where that joint does not rotate
+    (see :func:`collapse_single_child_joint`).
     """
     parents = aug['parents']
     n_joints = len(parents)

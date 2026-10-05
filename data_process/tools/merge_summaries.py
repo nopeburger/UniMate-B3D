@@ -85,7 +85,7 @@ def merge_summaries(output_dir, fps=30, keep_shards=False):
     af_path = os.path.join(output_dir, "clip_frames.json")
     frames = {}
     if os.path.isfile(af_path):
-        # Ignore a "_summary" block embedded by older exporter versions.
+        # A "_summary" block in the file is not a clip.
         frames = {k: v for k, v in _load(af_path).items() if k != "_summary"}
     af_shards = sorted(glob.glob(os.path.join(output_dir, "clip_frames_worker*.json")))
     for shard in af_shards:

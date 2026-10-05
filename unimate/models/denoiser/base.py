@@ -221,6 +221,13 @@ class UniMateDenoiserBase(nn.Module):
             nn.init.normal_(self.cond_embedder.weight, std=0.02)
             nn.init.constant_(self.cond_embedder.bias, 0)
 
+        # Depth embedding: _basic_init skips nn.Embedding, whose N(0, 1)
+        # default makes this per-joint constant ~10x louder (RMS 1.0) than the
+        # motion tokens (~0.1) it is added to, so after the block norms nearly
+        # all of each token's energy at step 0 is the depth code.
+        if self.use_depth_emb:
+            nn.init.normal_(self.depth_embedding.weight, std=0.02)
+
         # Zero-out adaLN modulation layers in UniMate blocks:
         for block in self.transformer_blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
@@ -305,7 +312,9 @@ class UniMateDenoiserBase(nn.Module):
         # masked row (which returns NaN).
         if force_mask:
             drop = torch.ones(tokens.shape[0], dtype=torch.bool, device=tokens.device)
-        elif self.training and self.cond_mask_prob > 0.:
+        elif self.training:
+            # An all-False draw at cond_mask_prob == 0 still routes
+            # null_caption through torch.where below, so DDP sees it used.
             drop = torch.bernoulli(
                 torch.ones(tokens.shape[0], device=tokens.device) * self.cond_mask_prob
             ).to(torch.bool)

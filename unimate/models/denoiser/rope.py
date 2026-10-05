@@ -133,15 +133,16 @@ class RopeND:
 
     def _get_pos_embs(
         self, position_ids: torch.Tensor, device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Look up (or lazily create) per-axis embeddings and concatenate.
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """Look up (or lazily create) the per-axis embeddings.
 
         Args:
             position_ids: ``(nd, L)`` integer position indices per axis.
             device: Target device for the frequency tables.
 
         Returns:
-            ``(cos, sin)`` each of shape ``(L, head_dim)``.
+            ``(cos, sin)``: per-axis lists, entry ``i`` of shape
+            ``(L, split_dims[i])``.
         """
         if position_ids.dim() == 1:
             position_ids = position_ids.unsqueeze(0)
@@ -161,7 +162,7 @@ class RopeND:
             cos_parts.append(getattr(self, cache_key_cos)[position_ids[i, :], :])
             sin_parts.append(getattr(self, cache_key_sin)[position_ids[i, :], :])
 
-        return torch.cat(cos_parts, dim=-1), torch.cat(sin_parts, dim=-1)
+        return cos_parts, sin_parts
 
     # ------------------------------------------------------------------
     # Forward
@@ -183,11 +184,24 @@ class RopeND:
         Returns:
             Rotated ``(q, k)`` with the same shapes.
         """
-        cos_emb, sin_emb = self._get_pos_embs(position_ids, device=q.device)
-        # Shape (L, C) → (1, 1, L, C) to broadcast over (B, H, L, C)
-        cos_emb = cos_emb.unsqueeze(0).unsqueeze(0)
-        sin_emb = sin_emb.unsqueeze(0).unsqueeze(0)
-        return _apply_rotary_pos_emb(q, k, cos_emb, sin_emb)
+        cos_parts, sin_parts = self._get_pos_embs(position_ids, device=q.device)
+        if self.nd == 1:
+            # Shape (L, C) → (1, 1, L, C) to broadcast over (B, H, L, C)
+            return _apply_rotary_pos_emb(
+                q, k, cos_parts[0][None, None], sin_parts[0][None, None])
+        # Each axis rotates its own block of channels: rotate_half pairs
+        # channels within a block, so a pair always shares one angle.
+        q_out, k_out, start = [], [], 0
+        for cos_emb, sin_emb, dim in zip(cos_parts, sin_parts, self.split_dims):
+            # Shape (L, d) → (1, 1, L, d) to broadcast over (B, H, L, d)
+            q_i, k_i = _apply_rotary_pos_emb(
+                q[..., start:start + dim], k[..., start:start + dim],
+                cos_emb[None, None], sin_emb[None, None],
+            )
+            q_out.append(q_i)
+            k_out.append(k_i)
+            start += dim
+        return torch.cat(q_out, dim=-1), torch.cat(k_out, dim=-1)
 
 
 # ---------------------------------------------------------------------------

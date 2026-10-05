@@ -7,8 +7,8 @@ Supports three backends (see :mod:`data_process.vlm_caption.backends`):
 
 The backend is auto-detected from the model name, or set explicitly via
 ``--backend``. ``--task`` selects the dataset system prompt (see
-:mod:`data_process.vlm_caption.prompts`): ``mixamo``, ``objaverse`` or
-``truebones``.
+:mod:`data_process.vlm_caption.prompts`): ``mixamo``, ``objaverse``,
+``truebones``, or ``general`` (your extra assets; the objaverse prompt).
 
 Input layout: ``<render_root>/<motion_name>/v00{0..3}/*.png`` — one
 directory per motion with one sub-directory of frame PNGs per camera view.
@@ -39,6 +39,7 @@ Usage:
 
 import argparse
 import os
+import sys
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -187,10 +188,10 @@ def caption_batch(
 
     captions = load_json(save_path)
 
-    # Resume from the merged output as well: shard files are not cleaned up
-    # after a merge, so a tidied-up directory would otherwise re-caption the
-    # whole dataset. The shard wins on conflict; only the shard's own entries
-    # are written back to save_path.
+    # Resume from the merged output as well: a shard holds only this run's
+    # clips (merged shards are renamed away), so without it every clip would
+    # be captioned again. The shard wins on conflict; only the shard's own
+    # entries are written back to save_path.
     already_done = dict(captions)
     if save_path != output_json:
         for name, caption in load_json(output_json).items():
@@ -371,12 +372,17 @@ def caption_batch(
         n_ok, n_err, len(captions), save_path))
     if n_err:
         logger.info("Failed motion names appended to {}".format(failed_path))
-    return captions
+    return captions, n_err
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Exit status of a run that finished with clips left uncaptioned (listed in
+# the *_failed.txt file); run_caption_motion.sh merges the shards anyway.
+EXIT_CLIPS_FAILED = 3
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -436,8 +442,8 @@ def parse_args():
     parser.add_argument('--base_url', type=str, default=None,
                         help='[openai] Override API base URL.')
     parser.add_argument('--max_retries', type=int, default=MAX_RETRIES,
-                        help='[openai/gemini] Max retry attempts for '
-                             'empty responses.')
+                        help='Max retry attempts for empty or unusable '
+                             'responses (every backend).')
 
     # ── Gemini 3-specific ───────────────────────────────────────────────────
     parser.add_argument('--thinking_level', type=str, default='low',
@@ -535,7 +541,7 @@ def main():
         )
 
     # ── Run ─────────────────────────────────────────────────────────────────
-    caption_batch(
+    _, n_err = caption_batch(
         render_root=args.render_root,
         backend=backend,
         system_prompt=system_prompt,
@@ -558,6 +564,10 @@ def main():
         media_resolution=args.media_resolution,
         thinking_budget=args.thinking_budget,
     )
+    if n_err:
+        # Finished, but some clips have no caption: distinct from a crash (1),
+        # so the multi-GPU wrapper still merges the shards.
+        sys.exit(EXIT_CLIPS_FAILED)
 
 
 if __name__ == "__main__":

@@ -44,7 +44,7 @@ if [[ "$DATASET" == "objaverse_renders" ]]; then
     REPO=Linzhan/Objaverse-XL-Rigged-Animated-Renders
     RAW_DIR=${RAW_DIR:-dataset/raw/objaverse_renders}
     echo "Downloading $REPO -> $RAW_DIR"
-    exec hf download "$REPO" --type dataset --local-dir "$RAW_DIR" "$@"
+    exec hf download "$REPO" --repo-type dataset --local-dir "$RAW_DIR" "$@"
 fi
 
 require_dataset "$DATASET"
@@ -73,7 +73,7 @@ esac
 RAW_DIR=${RAW_DIR:-dataset/raw/$DATASET}
 
 echo "Downloading $REPO -> $RAW_DIR"
-if ! hf download "$REPO" --type dataset --local-dir "$RAW_DIR" "$@"; then
+if ! hf download "$REPO" --repo-type dataset --local-dir "$RAW_DIR" "$@"; then
     if [[ "$DATASET" == "truebones" ]]; then
         echo "Download failed. Note that only annotations are hosted; the motion files" >&2
         echo "are commercial: purchase the Truebones ZOO pack from https://truebones.com" >&2

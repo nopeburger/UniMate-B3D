@@ -369,6 +369,9 @@ def parse_response(text, raw_names, clean_names):
     - The clean name is re-sourced from ``clean_names`` so the LLM can't
       drift the canonical label.
     - The sides are not swapped (invariant I3, see :func:`_validate_sides`).
+    - ``body_axis``, when given, is a JSON boolean, true exactly when
+      ``source`` is ``'body_axis'`` (invariant I4); omitted, it follows
+      ``source``.
     """
     if not text or not text.strip():
         raise ValueError("empty response")
@@ -392,7 +395,7 @@ def parse_response(text, raw_names, clean_names):
     r_raw, _ = _hip_fields(data["r_hip"], "r_hip")
     l_raw, _ = _hip_fields(data["l_hip"], "l_hip")
     source = str(data["source"]).strip().lower()
-    body_axis = bool(data.get("body_axis", False))
+    body_axis = data.get("body_axis")
 
     if not r_raw and not l_raw:
         return empty_entry()
@@ -407,9 +410,20 @@ def parse_response(text, raw_names, clean_names):
     if l_raw not in raw_names:
         raise ValueError("l_hip.raw {!r} not in input raw joint list".format(l_raw))
 
+    if body_axis is None:
+        body_axis = source == "body_axis"
+    elif not isinstance(body_axis, bool):
+        # bool("false") is True: a string would turn a lateral pair into a
+        # body axis and rotate every clip of the rig by 90 degrees.
+        raise ValueError("body_axis must be a JSON boolean, got {!r}".format(body_axis))
+    elif body_axis != (source == "body_axis"):
+        # Invariant I4: body_axis iff source == 'body_axis'.
+        raise ValueError("body_axis={} disagrees with source={!r}".format(
+            body_axis, source))
+
     r_idx = raw_names.index(r_raw)
     l_idx = raw_names.index(l_raw)
-    is_axis = body_axis or source == "body_axis"
+    is_axis = body_axis
     _validate_sides(clean_names[r_idx], clean_names[l_idx], is_axis)
     if not is_axis:
         # Invariant I6: a lateral pair must mirror the SAME part — a
@@ -429,7 +443,7 @@ def parse_response(text, raw_names, clean_names):
         "l_hip": {"raw": raw_names[l_idx], "clean": clean_names[l_idx]},
         "source": source or "pair",
     }
-    if body_axis or source == "body_axis":
+    if body_axis:
         entry["body_axis"] = True
     return entry
 

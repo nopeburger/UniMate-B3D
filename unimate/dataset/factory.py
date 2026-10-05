@@ -4,7 +4,7 @@ from typing import Optional, Set
 
 from torch.utils.data import DataLoader
 
-from unimate.dataset.mixture.dataset import Mixture, MixtureSampler
+from unimate.dataset.mixture.dataset import Mixture, MixtureSampler, SkeletonDataset
 from unimate.dataset.mixture.collate import mixture_batch_collate
 
 
@@ -72,12 +72,54 @@ def create_dataset(
         target_object_types=target_object_types,
         target_clip_stems=target_clip_stems,
         stats_path=stats_path,
+        # Sampling always conditions on the normal caption; generic / detail
+        # ones are a training-time augmentation, so inference never loads them.
+        generic_caption_prob=0.0 if inference else dataset_config.generic_caption_prob,
+        detail_caption_prob=0.0 if inference else dataset_config.detail_caption_prob,
     )
 
     # Propagate auto-computed max_joints and max_depth back to config so model uses them
     dataset_config.max_joints = dataset.max_joints
     dataset_config.max_depth = dataset.max_depth
+    # Stats loaded from ``stats_path`` may override the stats settings; keep
+    # the saved config.json truthful about the normalization in use.
+    md = dataset.motion_dataset
+    dataset_config.use_dataset_stats = md.use_dataset_stats
+    dataset_config.balanced_stats = md.balanced_stats
+    dataset_config.tie_std = md.tie_std
 
+    return dataset
+
+
+def create_skeleton_dataset(dataset_config, model_config, stats_path: str):
+    """A dataset for sampling on skeletons given by their cond entries alone
+    (:class:`SkeletonDataset`): the run's padded widths (``config.json``) and
+    normalization stats (``dataset_stats.npy``), no feature directory read.
+    Add skeletons with ``.motion_dataset.add_cond_object``."""
+    if dataset_config.max_joints <= 0 or dataset_config.max_depth <= 0:
+        raise ValueError(
+            f"Sampling needs the run's saved max_joints/max_depth in its config, got "
+            f"max_joints={dataset_config.max_joints}, max_depth={dataset_config.max_depth}.")
+    dataset = SkeletonDataset(
+        stats_path=stats_path,
+        max_motion_length=dataset_config.max_motion_length,
+        max_joints=dataset_config.max_joints,
+        max_depth=dataset_config.max_depth,
+        topology_condition_type=dataset_config.topology_condition_type,
+        feature_len=dataset_config.feature_len,
+        text_encoder_type=model_config.text_encoder_type,
+        text_encoder_version=model_config.text_encoder_version,
+        use_dataset_stats=dataset_config.use_dataset_stats,
+        balanced_stats=dataset_config.balanced_stats,
+        tie_std=dataset_config.tie_std,
+        max_freqs=model_config.max_freqs,
+        ground_motion_height=dataset_config.ground_motion_height,
+        realign_feature=dataset_config.realign_feature,
+    )
+    md = dataset.motion_dataset
+    dataset_config.use_dataset_stats = md.use_dataset_stats
+    dataset_config.balanced_stats = md.balanced_stats
+    dataset_config.tie_std = md.tie_std
     return dataset
 
 
@@ -87,12 +129,27 @@ def create_train_dataloader(
     balanced: bool = False,
     batch_size: int = 16,
     num_workers: int = 8,
+    stats_path: Optional[str] = None,
+    seed: int = 0,
 ):
-    """Build the training DataLoader over the train split of the Mixture dataset."""
-    dataset = create_dataset(dataset_config, model_config)
+    """Build the training DataLoader over the train split of the Mixture dataset.
 
+    ``seed`` (``training.seed``) seeds the balanced sampler's draw order.
+
+    ``stats_path`` loads normalization stats from disk instead of computing
+    them from the data (resume / fine-tune keep the normalization the
+    checkpoint was trained with).
+    """
+    dataset = create_dataset(dataset_config, model_config, stats_path=stats_path)
+
+    if not balanced and dataset_config.sampler_dataset_weights is not None:
+        raise ValueError("dataset.sampler_dataset_weights needs training.balanced=true "
+                         "(MixtureSampler); without it clips are drawn uniformly")
     sampler = MixtureSampler(dataset, alpha=dataset_config.sampler_alpha,
-                             dataset_alpha=dataset_config.sampler_dataset_alpha) if balanced else None
+                             dataset_alpha=dataset_config.sampler_dataset_alpha,
+                             dataset_weights=dataset_config.sampler_dataset_weights,
+                             seed=seed,
+                             ) if balanced else None
 
     return DataLoader(
         dataset,

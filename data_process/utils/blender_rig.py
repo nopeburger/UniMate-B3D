@@ -12,7 +12,9 @@ Organized as five sections:
 5. Character export — export the animated mesh + armature to GLB/FBX.
 
 The counterpart for the *export* direction (Blender scene → NPZ) lives in
-:mod:`data_process.utils.blender_export`.
+:mod:`data_process.utils.blender_export`; the export stage's rest-pose GLB per
+asset in :mod:`data_process.utils.processed_assets` (bpy) and
+:mod:`data_process.utils.asset_files` (paths and notes, bpy-free).
 """
 
 import os
@@ -62,13 +64,14 @@ def select_objs(obj_list=None, deselect_first=False):
 def load_file(filepath, *args, **kwargs):
     """Import a 3D file and return the list of newly-added scene objects."""
     old_objs = set(bpy.context.scene.objects)
-    if filepath.endswith(".glb"):
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext in (".glb", ".gltf"):
         bpy.ops.import_scene.gltf(filepath=filepath, *args, **kwargs)
-    elif filepath.endswith(".fbx"):
+    elif ext == ".fbx":
         bpy.ops.import_scene.fbx(filepath=filepath, *args, **kwargs)
-    elif filepath.endswith(".obj"):
+    elif ext == ".obj":
         bpy.ops.wm.obj_import(filepath=filepath, *args, **kwargs)
-    elif filepath.endswith(".ply"):
+    elif ext == ".ply":
         bpy.ops.wm.ply_import(filepath=filepath, *args, **kwargs)
     else:
         raise RuntimeError(f"Invalid input file: {filepath}")
@@ -101,10 +104,16 @@ def repair_and_pack_textures(source_path):
     (their texture files could not be found on disk).
     """
     src_dir = os.path.dirname(os.path.abspath(source_path))
-    try:
-        bpy.ops.file.find_missing_files(directory=src_dir)
-    except RuntimeError as exc:
-        logger.warning(f"find_missing_files failed: {exc}")
+    # A symlinked asset keeps its textures beside the link target.
+    search_dirs = [src_dir]
+    real_dir = os.path.dirname(os.path.realpath(source_path))
+    if real_dir != src_dir:
+        search_dirs.append(real_dir)
+    for directory in search_dirs:
+        try:
+            bpy.ops.file.find_missing_files(directory=directory)
+        except RuntimeError as exc:
+            logger.warning(f"find_missing_files failed in {directory}: {exc}")
 
     broken = []
     for img in bpy.data.images:
@@ -352,6 +361,64 @@ def rebuild_action_from_data(armature, anim_data_dict):
 EXTRA_BONES_STRATEGIES = ('keep', 'merge', 'remove')
 
 
+def skin_rigid_parts(armature):
+    """Bind the meshes hanging under *armature* without an Armature modifier
+    (rigid parts parented to a bone or to the armature object) to one bone
+    each, weight 1, keeping their rest-pose world transform: the bone they (or
+    their nearest ancestor) are parented to, else the main root bone (the one
+    with the most bones below it). They then move with that bone like before,
+    and count as skinned for code that keeps only skinned meshes. Every part's
+    bone is chosen before any part is re-parented (a part under another part
+    would lose its bone otherwise), the armature is put in its rest pose
+    meanwhile, and a mesh shared with other objects is copied first (vertex
+    groups belong to the mesh). Returns the names of the meshes converted."""
+    bones = armature.data.bones
+    roots = [b for b in bones if b.parent is None]
+    if not roots:
+        return []
+    main_root = max(roots, key=lambda b: len(b.children_recursive)).name
+    plan = []
+    for obj in armature.children_recursive:
+        if obj.type != 'MESH' or any(m.type == 'ARMATURE' for m in obj.modifiers):
+            continue
+        bone, node = None, obj
+        while node is not None and node != armature:
+            if node.parent == armature and node.parent_type == 'BONE' \
+                    and node.parent_bone in bones:
+                bone = node.parent_bone
+                break
+            node = node.parent
+        plan.append((obj, bone or main_root))
+    if not plan:
+        return []
+    pose_position = armature.data.pose_position
+    armature.data.pose_position = 'REST'
+    update_scene()
+    worlds = [obj.matrix_world.copy() for obj, _ in plan]
+    for obj, bone in plan:
+        if obj.data.users > 1:
+            obj.data = obj.data.copy()
+        for group in list(obj.vertex_groups):      # unbound groups named like
+            if group.name in bones and group.name != bone:   # bones would deform now
+                obj.vertex_groups.remove(group)
+        group = obj.vertex_groups.get(bone) or obj.vertex_groups.new(name=bone)
+        group.add(list(range(len(obj.data.vertices))), 1.0, 'REPLACE')
+        modifier = obj.modifiers.new(name='Armature', type='ARMATURE')
+        modifier.object = armature
+    for obj, _ in plan:
+        obj.parent = armature
+        obj.parent_type = 'OBJECT'
+    update_scene()
+    for (obj, _), world in zip(plan, worlds):
+        obj.matrix_world = world
+    update_scene()
+    armature.data.pose_position = pose_position
+    update_scene()
+    logger.info(f"Bound {len(plan)} rigid part(s) to their bones: "
+                f"{[(o.name, b) for o, b in plan][:5]}")
+    return [obj.name for obj, _ in plan]
+
+
 def find_skinned_meshes(armature):
     """Return all mesh objects whose Armature modifier targets *armature*."""
     meshes = []
@@ -365,20 +432,43 @@ def find_skinned_meshes(armature):
     return meshes
 
 
-def build_ancestor_map(armature, kept_bone_set):
-    """Map each armature bone NOT in *kept_bone_set* to its nearest kept ancestor.
+def _topmost_kept(bone, kept_bone_set):
+    """The kept bone nearest *bone* in its own subtree (breadth first), or None."""
+    queue = list(bone.children)
+    while queue:
+        b = queue.pop(0)
+        if b.name in kept_bone_set:
+            return b
+        queue.extend(b.children)
+    return None
 
-    Returns ``{dropped_name: ancestor_name_or_None}``. ``None`` indicates
-    the chain to the root is entirely dropped (orphan bone).
+
+def build_ancestor_map(armature, kept_bone_set):
+    """Map each armature bone NOT in *kept_bone_set* to the kept bone that
+    takes its weights: its nearest kept ancestor. A bone with none (a dropped
+    root, such as the pass-through root the export promotes away, or a separate
+    root) maps to the topmost kept bone of its own subtree, else to the main
+    kept root (the one with the most kept bones below it), so its vertices
+    follow the body instead of losing their weights.
+
+    Returns ``{dropped_name: kept_name_or_None}``; ``None`` only when no
+    bone is kept.
     """
+    bones = armature.data.bones
+    kept_roots = [b for b in bones if b.name in kept_bone_set
+                  and not any(a.name in kept_bone_set for a in b.parent_recursive)]
+    main_root = max(kept_roots, key=lambda b: sum(c.name in kept_bone_set
+                                                  for c in b.children_recursive),
+                    default=None)
     mapping = {}
-    for bone in armature.data.bones:
+    for bone in bones:
         if bone.name in kept_bone_set:
             continue
         parent = bone.parent
         while parent is not None and parent.name not in kept_bone_set:
             parent = parent.parent
-        mapping[bone.name] = parent.name if parent is not None else None
+        target = parent or _topmost_kept(bone, kept_bone_set) or main_root
+        mapping[bone.name] = target.name if target is not None else None
     return mapping
 
 
@@ -414,7 +504,9 @@ def transfer_vertex_group(mesh_obj, src_name, dst_name):
 
 
 def merge_extra_bone_weights(armature, kept_bone_set):
-    """Transfer weights of dropped bones to their nearest kept ancestor.
+    """Transfer weights of dropped bones to the kept bone that takes them
+    (:func:`build_ancestor_map`: the nearest kept ancestor; for a dropped
+    root, the kept bone below it).
 
     Returns the ancestor map used (for logging).
     """
@@ -537,6 +629,41 @@ def remove_armature_bones(armature, bone_names):
     bpy.ops.object.mode_set(mode='OBJECT')
 
 
+_DEDUP_SUFFIX = re.compile(r'^(.*)\.(\d{3})$')
+
+
+def rename_truncated_bones(armature, motion_names):
+    """Give bones the motion's name where the two differ only in how a long
+    name was cut. Blender caps bone names at 63 bytes and de-duplicates with
+    ``.NNN``, and Blender versions differ in how many characters they keep
+    before the suffix (``<base>.001`` in one, ``<base>h.001`` in another). A
+    motion name absent from
+    the armature matches the one bone, itself not a motion name and cut at the
+    limit (63 bytes), with the same ``.NNN`` suffix whose base starts with the
+    motion name's base (itself cut: at least 59 bytes); renaming the bone
+    renames its vertex groups too. Returns ``{old: new}``."""
+    wanted = [str(n) for n in motion_names]
+    wanted_set = set(wanted)
+    bone_names = set(armature.data.bones.keys())
+    free = [b for b in bone_names if b not in wanted_set and len(b.encode()) == 63]
+    renames = {}
+    for name in wanted:
+        m = _DEDUP_SUFFIX.match(name)
+        if name in bone_names or m is None or len(name.encode()) < 59:
+            continue
+        cands = [b for b in free if b not in renames
+                 and (mb := _DEDUP_SUFFIX.match(b)) is not None
+                 and mb.group(2) == m.group(2) and mb.group(1).startswith(m.group(1))]
+        if len(cands) == 1:
+            renames[cands[0]] = name
+    for old, new in renames.items():
+        armature.data.bones[old].name = new
+    if renames:
+        logger.info(f"Renamed {len(renames)} bone(s) cut differently from the motion's "
+                    f"names: {list(renames.items())[:3]}")
+    return renames
+
+
 def sync_armature_bones(armature, anim_bone_names, extra_bones_strategy='merge'):
     """Reconcile armature bones with the animation bone list.
 
@@ -544,8 +671,9 @@ def sync_armature_bones(armature, anim_bone_names, extra_bones_strategy='merge')
     NOT present in *anim_bone_names*:
 
     - ``'merge'`` (default): transfer each extra bone's vertex weights to
-      its nearest kept ancestor on every skinned mesh, then delete the
-      bone. Mesh stays attached; articulation in the merged region is lost.
+      its nearest kept ancestor on every skinned mesh (a dropped root's to
+      the kept bone below it, see :func:`build_ancestor_map`), then delete
+      the bone. Mesh stays attached; articulation in the merged region is lost.
     - ``'remove'``: delete the bones AND every mesh vertex whose dominant
       (max-weight) bone is one of them. Vertices with mixed influences
       whose primary bone survives are kept, so we don't punch holes near
@@ -562,6 +690,7 @@ def sync_armature_bones(armature, anim_bone_names, extra_bones_strategy='merge')
             f"extra_bones_strategy must be one of {EXTRA_BONES_STRATEGIES}, "
             f"got {extra_bones_strategy!r}"
         )
+    rename_truncated_bones(armature, anim_bone_names)
 
     armature_bone_set = {bone.name for bone in armature.data.bones}
     anim_bone_set = {str(name) for name in anim_bone_names}
@@ -580,8 +709,8 @@ def sync_armature_bones(armature, anim_bone_names, extra_bones_strategy='merge')
                 for src, dst in sorted(ancestor_map.items())
             )
             logger.warning(
-                f"Merged {len(extra)} extra armature bones into nearest kept "
-                f"ancestor and removed them: {summary}"
+                f"Merged {len(extra)} extra armature bones into the kept bone that "
+                f"takes their weights and removed them: {summary}"
             )
             remove_armature_bones(armature, extra)
         else:  # 'remove'
@@ -638,8 +767,8 @@ def export_selected_to_file(filepath, char_anim_type='glb', custom_props=False):
     """Export currently-selected scene objects to GLB or FBX.
 
     ``custom_props`` also exports object-level custom properties (glTF
-    extras / FBX user properties) — used by ``preprocess_char`` to carry the
-    canonical joint order inside the asset.
+    extras / FBX user properties) — used by the canonical bake to carry
+    the canonical joint order inside the asset.
     """
     if char_anim_type == 'glb':
         bpy.ops.export_scene.gltf(
@@ -675,5 +804,3 @@ def export_selected_to_file(filepath, char_anim_type='glb', custom_props=False):
     else:
         raise RuntimeError(f"Invalid char_anim_type: {char_anim_type}")
     logger.info(f"Saved animated character: {filepath}")
-
-

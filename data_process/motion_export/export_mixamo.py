@@ -15,6 +15,18 @@ JSONs (``*_worker{i}.json``) — merge them afterwards with
 ``python -m data_process.tools.merge_summaries`` (the
 ``run_export.sh`` wrapper does both automatically).
 
+``--save_glb`` (with ``--char_dir``, the characters: one rigged FBX/GLB each,
+e.g. ``dataset/raw/mixamo/character_refined``) also writes
+``rigs/<character>.glb`` per character: the character in its own rest pose
+on the export skeleton (the bones of every clip NPZ; extra bones such as eyes
+merged away), without animation (``processed_assets.export_asset_glb``), so any
+clip NPZ drives it. A character must have the 22 core joints stage 4 keeps
+(``MIXAMO_CORE_JOINTS``); missing finger or end bones are logged, a missing
+core joint is recorded in ``rigs/glb_errors/`` (the non-Mixamo-named rigs,
+e.g. a 3ds Max Biped). ``--glb_only`` writes only the missing character GLBs,
+from the NPZs already in ``motions/``, sharded over the workers, and nothing
+else. Existing GLBs are kept.
+
 Usage (Blender headless):
     blender -b -P data_process/motion_export/export_mixamo.py -- \
         --anim_dir dataset/raw/mixamo/animation_motion \
@@ -32,11 +44,16 @@ from loguru import logger
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
+from data_process.feature_extraction.metadata import MIXAMO_CORE_JOINTS
 from data_process.utils.blender_export import (
-    import_fbx,
+    asset_names, import_fbx, import_gltf, list_asset_files,
     load_scene, prepare_skeleton, extract_all_actions, save_rest_pose_vis,
     action_frame_range, save_motion, write_export_summary,
 )
+from data_process.utils.asset_files import (
+    processed_glb_path, record_glb_error, report_glb_errors,
+)
+from data_process.utils.processed_assets import build_asset_glb
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -106,6 +123,57 @@ def export_mixamo(anim_path, output_dir, fps=30, dtype=np.float64,
     return list(skel['bone_names']), skel['rest_anim_shared']
 
 
+# A character standing more than this factor taller or shorter than the export
+# skeleton was authored in other units and is scaled to it; real characters
+# stand about 0.7x (Mousey) to 1.25x its height.
+CHARACTER_RESCALE_TOL = 1.8
+
+
+def save_character_glbs(char_dir, output_dir, fps=30, worker_id=0, num_workers=1,
+                        reference=None):
+    """``rigs/<character>.glb`` for every character in *char_dir* that has
+    none (module docstring); failures are recorded, not raised.
+
+    *reference* is the clip NPZ giving the export skeleton (default: the
+    first in ``motions/``; a worker of a running export passes one it wrote
+    itself, since another worker's NPZ may still be being written).
+    """
+    if reference is None:
+        motion_dir = os.path.join(output_dir, "motions")
+        npzs = sorted(f for f in os.listdir(motion_dir) if f.endswith(".npz")) \
+            if os.path.isdir(motion_dir) else []
+        if not npzs:
+            logger.warning(f"No clip NPZ in {motion_dir} to take the export skeleton from; "
+                           f"character GLBs skipped.")
+            return
+        reference = os.path.join(motion_dir, npzs[0])   # every clip shares the skeleton
+    if not os.path.isdir(char_dir):
+        record_glb_error(output_dir, "_characters",
+                         f"Character directory {char_dir} does not exist; no character GLBs.")
+        return
+
+    char_paths = list_asset_files(char_dir)
+    try:
+        names = asset_names(char_paths)   # a name clash, before sharding
+    except ValueError as exc:
+        record_glb_error(output_dir, "_characters", f"{char_dir}: {exc}")
+        return
+    record_glb_error(output_dir, "_characters", None)
+    char_paths = char_paths[worker_id::num_workers]
+    logger.info(f"Character GLBs: {len(char_paths)} character(s) in {char_dir}"
+                + (f" (worker {worker_id}/{num_workers})" if num_workers > 1 else ""))
+    for path in char_paths:
+        name = names[path]
+        if os.path.isfile(processed_glb_path(output_dir, name)):
+            continue
+        importer = import_fbx if path.suffix.lower() == ".fbx" else import_gltf
+        build_asset_glb(name, reference, output_dir,
+                        lambda: load_scene(importer, path, fps=fps)[0],
+                        source_path=path, required=MIXAMO_CORE_JOINTS,
+                        rest_tol=None,   # each character keeps its own proportions
+                        rescale_tol=CHARACTER_RESCALE_TOL)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
@@ -127,12 +195,27 @@ def parse_args():
                         help="Total number of workers.")
     parser.add_argument("--vis", action=argparse.BooleanOptionalAction, default=True,
                         help="Render the per-clip MP4 preview (use --no-vis for bulk runs).")
+    parser.add_argument("--char_dir", type=str, default=None,
+                        help="Characters (one rigged FBX/GLB each) for --save_glb / --glb_only.")
+    parser.add_argument("--save_glb", action="store_true",
+                        help="Also write rigs/<character>.glb per character in --char_dir: the "
+                             "character in its rest pose on the export skeleton, no animation.")
+    parser.add_argument("--glb_only", action="store_true",
+                        help="Only write the missing character GLBs (from the NPZs already in "
+                             "motions/); no NPZ or summary JSON is written.")
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else sys.argv[1:]
     return parser.parse_args(argv)
 
 
 def main(args):
+    if (args.save_glb or args.glb_only) and not args.char_dir:
+        raise SystemExit("--save_glb / --glb_only need --char_dir (the characters).")
     os.makedirs(args.output_dir, exist_ok=True)
+    if args.glb_only:
+        save_character_glbs(args.char_dir, args.output_dir, fps=args.fps,
+                            worker_id=args.worker_id, num_workers=args.num_workers)
+        report_glb_errors(args.output_dir)
+        return
     worker_suffix = f"_worker{args.worker_id}" if args.num_workers > 1 else ""
     error_log = os.path.join(args.output_dir, f"export_errors{worker_suffix}.log")
 
@@ -157,6 +240,7 @@ def main(args):
         os.path.exists(joint_names_path) and os.path.exists(tpos_path))
 
     ref_bone_names = None
+    own_npz = None          # a clip this worker wrote: --save_glb's skeleton reference
     ref_rest_pos = None
     ref_rest_rot = None
     tpos_mismatches = []
@@ -171,6 +255,9 @@ def main(args):
                 continue
 
             bone_names, rest_anim = result
+            if own_npz is None:
+                stem = os.path.splitext(os.path.basename(anim_path))[0]
+                own_npz = os.path.join(args.output_dir, "motions", f"{stem}.npz")
             rest_pos = rest_anim.positions[0]   # (nbones, 3)
             rest_rot = rest_anim.rotations[0].qs  # (nbones, 4)
 
@@ -219,6 +306,12 @@ def main(args):
     all_joint_names = {"mixamo": ref_bone_names} if ref_bone_names else {}
     write_export_summary(args.output_dir, all_joint_names, fps=args.fps,
                          worker_suffix=worker_suffix)
+
+    if args.save_glb:
+        save_character_glbs(args.char_dir, args.output_dir, fps=args.fps,
+                            worker_id=args.worker_id, num_workers=args.num_workers,
+                            reference=own_npz if own_npz and os.path.isfile(own_npz) else None)
+        report_glb_errors(args.output_dir)
 
     if n_failed:
         logger.error(f"{n_failed}/{len(anim_paths)} clips failed; see {error_log}")

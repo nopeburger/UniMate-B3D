@@ -20,7 +20,7 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
 handle_help "$@"
-DATASET=${1:?Usage: run_caption_category.sh <truebones|mixamo|objaverse> [extra args...]}
+DATASET=${1:?Usage: run_caption_category.sh <truebones|mixamo|objaverse|general> [extra args...]}
 shift
 require_dataset "$DATASET"
 

@@ -5,7 +5,9 @@ top row, left/right bottom row) — the "flat" layout consumed by
 ``vlm_caption/classify_category.py``.
 
 Two input layouts are auto-detected per entry of ``--data_dir``:
-  - files:        ``<data_dir>/*.{glb,gltf,fbx}``  -> one grid per file stem
+  - files:        ``<data_dir>/*.{glb,gltf,fbx}``  -> one grid per asset name
+    (the stem with ``-`` and whitespace replaced by ``_``, as the general
+    exporter names it; objaverse stems are unchanged)
   - subdirectory: ``<data_dir>/<obj_type>/*.fbx``  -> one grid per object
     type, rendered from its main (all-in-one) FBX — Truebones layout.
 
@@ -21,7 +23,9 @@ from pathlib import Path
 
 from loguru import logger
 
-from data_process.utils.blender_export import find_main_fbx, sanitize_object_type
+from data_process.utils.blender_export import (
+    asset_names, find_main_fbx, load_excluded_stems, sanitize_object_type,
+)
 from data_process.utils.blender_render import (
     RENDERABLE_EXTS,
     RENDER_FPS,
@@ -34,7 +38,8 @@ from data_process.utils.blender_render import (
 def discover_assets(data_dir, species_grids=False):
     """Return (name, path) pairs to render, auto-detecting the layout.
 
-    Files directly under *data_dir* are rendered by stem; each
+    Files directly under *data_dir* (minus ``excluded.csv``) are rendered
+    by asset name; each
     subdirectory is treated as a Truebones-style object type and rendered
     from its main FBX (fallback: first FBX in the subdirectory).
 
@@ -45,18 +50,25 @@ def discover_assets(data_dir, species_grids=False):
     data_dir = Path(data_dir)
     assets = []
     seen_species = set()
+    # Per-file grids are named like the exporters name them (asset_names
+    # raises when two share a name) and skip excluded.csv, as the objaverse
+    # and general stages do; species grids keep the Truebones behaviour.
+    excluded = set() if species_grids else load_excluded_stems(data_dir)
+    files = [p for p in sorted(data_dir.iterdir())
+             if p.is_file() and p.suffix.lower() in RENDERABLE_EXTS and p.stem not in excluded]
+    names = {} if species_grids else asset_names(files)
 
+    for p in files:
+        if species_grids:
+            species = p.stem.split('-', 1)[0]
+            if species in seen_species:
+                continue
+            seen_species.add(species)
+            assets.append((sanitize_object_type(species), p))
+        else:
+            assets.append((names[p], p))
     for p in sorted(data_dir.iterdir()):
-        if p.is_file() and p.suffix.lower() in RENDERABLE_EXTS:
-            if species_grids:
-                species = p.stem.split('-', 1)[0]
-                if species in seen_species:
-                    continue
-                seen_species.add(species)
-                assets.append((sanitize_object_type(species), p))
-            else:
-                assets.append((p.stem, p))
-        elif p.is_dir():
+        if p.is_dir():
             main_fbx = find_main_fbx(str(p))
             if main_fbx is None:
                 fbxs = sorted(f for f in p.iterdir()
@@ -101,7 +113,7 @@ def main():
                         help="Directory of GLB/GLTF/FBX files, or of "
                              "per-object-type FBX subdirectories (Truebones).")
     parser.add_argument("--obj_name", type=str, default=None,
-                        help="Single asset name (file stem or object type) "
+                        help="Single asset name (asset name or object type) "
                              "to render (default: all).")
     parser.add_argument("--output_dir", type=str, required=True,
                         help="Flat directory for the <name>.png grids.")
@@ -118,8 +130,9 @@ def main():
                         help="EEVEE TAA render samples.")
     parser.add_argument("--keep-all-meshes", dest="keep_main_mesh_only",
                         action="store_false",
-                        help="Keep every mesh instead of only the "
-                             "highest-vertex one (multi-mesh characters).")
+                        help="Keep every mesh, instead of only those skinned to "
+                             "or parented under the armature (stray helper "
+                             "geometry included).")
     parser.add_argument("--species_grids", action="store_true",
                         help="Group {Species}-{Action}.fbx files by species "
                              "and render one grid per species (curated "

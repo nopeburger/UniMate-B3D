@@ -12,7 +12,7 @@ import numpy as np
 
 from Quaternions import Quaternions
 
-from unimate.utils.rotation_conversions import rotation_6d_to_matrix_np
+from unimate.utils.rotation_conversions import matrix_to_quaternion_np, rotation_6d_to_matrix_np
 
 
 # ===========================================================================
@@ -204,23 +204,42 @@ def realign_unimate_clip(clip_feats, parents):
     Returns:
         Re-aligned clip features (T, J, 12).
     """
+    q0 = Quaternions(matrix_to_quaternion_np(
+        rotation_6d_to_matrix_np(clip_feats[0, 0, 3:9][None])))[0]
+    return rotate_unimate_facing(clip_feats, parents, q0)
+
+
+def rotate_unimate_facing(clip_feats, parents, q):
+    """Re-express a clip in a world frame rotated by the facing quaternion ``q``.
+
+    Root facing (joint 0) becomes ``q_t * q^{-1}`` and the slots of the
+    root's direct children (which hold the root's world rotation, HML
+    reordering) become ``q * q_child``. RIFKE positions and local velocities
+    are expressed in the per-frame facing frame and do not change.
+
+    ``rotate_unimate_facing(clip, parents, q0)`` with ``q0`` the frame-0
+    facing is :func:`realign_unimate_clip`; applying ``-q0`` afterwards
+    restores the original frame.
+
+    Args:
+        clip_feats: Clip motion features (T, J, 12).
+        parents: Parent index list (J,).
+        q: Facing rotation as a single-element ``Quaternions``.
+
+    Returns:
+        Rotated clip features (T, J, 12).
+    """
     clip = clip_feats.copy()
 
-    # Decode first-frame root facing quaternion
-    q0 = Quaternions.from_transforms(
-        rotation_6d_to_matrix_np(clip[0, 0, 3:9][None]))[0]
-
-    # Root facing (joint 0): make relative to first frame
     root_6d = clip[:, 0, 3:9]
-    q_root = Quaternions.from_transforms(rotation_6d_to_matrix_np(root_6d))
-    clip[:, 0, 3:9] = (q_root * -q0).rotation_matrix(cont6d=True)
+    q_root = Quaternions(matrix_to_quaternion_np(rotation_6d_to_matrix_np(root_6d)))
+    clip[:, 0, 3:9] = (q_root * -q).rotation_matrix(cont6d=True)
 
-    # Direct children of root: apply facing rotation to root's local rotation
     for j, p in enumerate(parents):
         if p == 0:
             child_6d = clip[:, j, 3:9]
-            q_child = Quaternions.from_transforms(rotation_6d_to_matrix_np(child_6d))
-            clip[:, j, 3:9] = (q0 * q_child).rotation_matrix(cont6d=True)
+            q_child = Quaternions(matrix_to_quaternion_np(rotation_6d_to_matrix_np(child_6d)))
+            clip[:, j, 3:9] = (q * q_child).rotation_matrix(cont6d=True)
 
     return clip
 
@@ -235,7 +254,13 @@ def hml_rotations_to_bvh_quaternions(motion_rot6d_hml, parents):
     HML convention (see :func:`compute_cont6d_params`):
     ``hml[j] = bvh[parents[j]]`` for ``j >= 1``. Slot 0 holds the root
     facing quaternion — it's ignored here, since the root's global rotation
-    is recovered from any child-of-root slot (which stores ``bvh[0]``).
+    is recovered from the child-of-root slots (which store ``bvh[0]``).
+
+    A joint with several children has one copy of its rotation per child.
+    They are identical in real data but differ slightly in generated motion,
+    and a motion edit may pin only some of them, so the decoded rotation is
+    their chordal mean (the sum of the matrices projected back onto SO(3))
+    rather than any single copy. Leaf joints keep the identity.
 
     Args:
         motion_rot6d_hml: 6D rotations in HML order (T, J, 6).
@@ -247,9 +272,17 @@ def hml_rotations_to_bvh_quaternions(motion_rot6d_hml, parents):
     T, J, _ = motion_rot6d_hml.shape
     bvh_rot_mat = np.tile(np.eye(3), (T, J, 1, 1))  # identity defaults
     hml_mat = rotation_6d_to_matrix_np(motion_rot6d_hml)
+    copy_sum = np.zeros((T, J, 3, 3))
+    has_child = np.zeros(J, dtype=bool)
     for j, p in enumerate(parents[1:], 1):
-        bvh_rot_mat[:, p] = hml_mat[:, j]
-    return Quaternions.from_transforms(bvh_rot_mat)
+        copy_sum[:, p] += hml_mat[:, j]
+        has_child[p] = True
+    U, _, Vt = np.linalg.svd(copy_sum[:, has_child])
+    # Flip the last singular direction where needed so the result is a
+    # rotation (det +1), not a reflection.
+    U[..., :, -1] *= np.sign(np.linalg.det(U @ Vt))[..., None]
+    bvh_rot_mat[:, has_child] = U @ Vt
+    return Quaternions(matrix_to_quaternion_np(bvh_rot_mat))
 
 
 def fk_global_positions(rotations_bvh, parents, offsets, root_positions):
@@ -301,7 +334,7 @@ def recover_unimate_root_quat_and_pos(data):
     Returns:
         (r_rot_quat (..., T), r_pos (..., T, 3)).
     """
-    r_rot_quat = Quaternions.from_transforms(rotation_6d_to_matrix_np(data[:, 3:9]))
+    r_rot_quat = Quaternions(matrix_to_quaternion_np(rotation_6d_to_matrix_np(data[:, 3:9])))
 
     r_pos = np.zeros(data.shape[:-1] + (3,))  # (T, 3)
     r_pos[..., 1:, [0, 2]] = data[..., :-1, [9, 11]]  # XZ velocity

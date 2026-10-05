@@ -2,7 +2,8 @@
 
 The three dataset prompts (``mixamo``, ``objaverse``, ``truebones``) produce
 <12-word motion captions and are selected via ``--task`` in
-:mod:`data_process.vlm_caption.caption_motion`. ``CATEGORY_PROMPT`` is the
+:mod:`data_process.vlm_caption.caption_motion`; ``general`` (extra assets of
+your own, objaverse layout) uses the objaverse prompt. ``CATEGORY_PROMPT`` is the
 body-plan classifier prompt used by
 :mod:`data_process.vlm_caption.classify_category`.
 
@@ -420,6 +421,9 @@ TASK_PROMPTS = {
     "mixamo": MIXAMO_PROMPT,
     "objaverse": OBJAVERSE_PROMPT,
     "truebones": TRUEBONES_PROMPT,
+    # Arbitrary rigged objects, like objaverse; the same prompt keeps the
+    # caption style of the extra data identical to the corpus it joins.
+    "general": OBJAVERSE_PROMPT,
 }
 
 def get_prompt(task):

@@ -149,7 +149,8 @@ def create_transport(
             path-dependent default (0 for the stable velocity + Linear/GVP
             combination used by all current configs).
         training_config: supplies ``lambda_geo`` / ``lambda_smooth`` for the
-            auxiliary losses.
+            auxiliary losses and ``t_sampling`` / ``t_logit_mean`` /
+            ``t_logit_std`` for the training-time distribution.
     """
 
     if prediction == "noise":
@@ -192,6 +193,9 @@ def create_transport(
         sample_eps=sample_eps,
         lambda_geo=training_config.lambda_geo,
         lambda_smooth=training_config.lambda_smooth,
+        t_sampling=training_config.t_sampling,
+        t_logit_mean=training_config.t_logit_mean,
+        t_logit_std=training_config.t_logit_std,
     )
 
     return state

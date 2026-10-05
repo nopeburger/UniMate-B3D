@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import tempfile
+import unicodedata
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _REPO_ROOT not in sys.path:
@@ -24,6 +25,7 @@ if _REPO_ROOT not in sys.path:
 from data_process.joint_annotation.vocab import (
     CANONICAL,
     ELK_MAP,
+    FOREIGN_PARTS,
     JAPANESE_COMPOUND_ANIMALS,
     JAPANESE_COMPOUND_NAMES,
     JAPANESE_WORDS_LOWER,
@@ -33,8 +35,10 @@ from data_process.joint_annotation.vocab import (
     PIRRANA_COMPOUNDS,
     REMOVE_PREFIXES,
     SABRECAT_MAP,
+    SIDE_WORDS,
     SPIDER_MAP,
     STANDALONE_MAP,
+    is_canonical_label,
 )
 
 
@@ -67,6 +71,8 @@ _TRAILING_TOKEN_RE = re.compile(r'[._](\d+|[LRlr]|x)$')
 _FINGER_CODE_RE = re.compile(r'^[Ff]inger([0-4])\d*(Nub)?$')
 _FINGER_CODE = {"0": "Thumb", "1": "Index", "2": "Middle", "3": "Ring",
                 "4": "Pinky"}
+# 3ds Max CAT digits (1-based finger, then segment): 'Digit21' = index.
+_DIGIT_CODE_RE = re.compile(r'^Digit([1-5])\d*$')
 # CMU / mocap-style segmented fingers (1-based): 'Finger1Metacarpal' etc.
 _FINGER_SEG_RE = re.compile(
     r'^[Ff]inger([1-5])(Metacarpal|Proximal|Medial|Distal|Tip)\d*$')
@@ -85,6 +91,108 @@ _NAMESPACE_RE = re.compile(r'^[A-Za-z][\w .-]*:')
 # (any index; separator optional when a side letter follows), optionally
 # behind a BN_ namespace.
 _BIP_PREFIX_RE = re.compile(r'^(?:BN_)?Bip\d+(?:[-_ ]+|(?=[LR][A-Z]))')
+
+
+# An end bone's name ending: 'LeftToesEND', 'Foot.L_end', 'Bip01 R Toe0Nub'.
+_END_SUFFIX_RE = re.compile(r'(?:[_.\s]end|End|END|Nub)$')
+# FBX ASCII escapes in names written by some exporters ('FBXASC032' = space).
+_FBX_ESCAPE_RE = re.compile(r'FBXASC(\d{3})')
+# Words of a raw name: capital runs ('CAT', 'R'), Capitalized or lower-case
+# words, digit runs ('LowManRightUpLeg' -> Low Man Right Up Leg).
+_WORD_RE = re.compile(r'[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+')
+# Leg codes of legged robots and quadruped rigs: Front / Rear / Back / Hind,
+# then the side ('FR_hip', 'RL_calf', 'fl_knee'); the reviewed labels write
+# every hind leg as 'Back'. Accepted only when the rest is a known part.
+_LEG_CODE_RE = re.compile(r'^([FRBHfrbh])([LRlr])[_.](\w+)$')
+_LEG_QUALIFIER = {'F': 'Front', 'R': 'Back', 'B': 'Back', 'H': 'Back'}
+
+
+def extract_leg_code(name):
+    # type: (str) -> Tuple[str, str]
+    """``(side, label)`` of a leg-coded name ('RL_calf' -> Left, 'Back Shin'),
+    else ``('', '')``. Runs before the generic side rules, which would read
+    'RL_' as Right."""
+    m = _LEG_CODE_RE.match(name)
+    if not m:
+        return '', ''
+    label = _part_label(_WORD_RE.findall(m.group(3)))
+    if not label or label == 'Bone':
+        return '', ''
+    return ('Left' if m.group(2).upper() == 'L' else 'Right'), \
+        f'{_LEG_QUALIFIER[m.group(1).upper()]} {label}'
+# A lower-case side letter glued to, or dotted onto, a part word ('rthigh',
+# 'l.brazo'); accepted only when the rest is a known part.
+_LOWER_SIDE_RE = re.compile(r'^([lr])[._]?([a-z]{2,})\d*$')
+
+
+def _part_label(tokens):
+    """Canonical label of a run of word tokens ('Up', 'Leg' -> 'Thigh';
+    'Muslo' -> 'Thigh'), or '' when none of it is a known part."""
+    words = [t for t in tokens if not t.isdigit()]
+    if not words:
+        return ''
+    joined = _canon(''.join(w[:1].upper() + w[1:] for w in words))
+    if joined:
+        return joined
+    out = []
+    for w in words:
+        value = _canon(w)
+        if value is None:
+            plain = unicodedata.normalize('NFKD', w).encode('ascii', 'ignore').decode().lower()
+            value = FOREIGN_PARTS.get(plain)
+        if value:
+            out.append(value)
+    if not out:
+        # A canonical part no map lists ('hip'), when nothing else names it.
+        out = [w.capitalize() for w in words
+               if w.lower() not in ('end', 'nub') and is_canonical_label(w.capitalize())]
+    return ' '.join(out)
+
+
+def extract_inner_side(name):
+    # type: (str) -> Tuple[str, str]
+    """Side word inside a name that carries rig words around it, for names the
+    prefix/suffix rules miss: 'LowManRightUpLeg', 'robo_RightUpLeg',
+    'HumanRCollarbone', 'CATRigRLeg1', 'Muslo_Der_01', 'jambe_droite',
+    'rthigh_12', 'l.brazo_1'.
+
+    A side word (``vocab.SIDE_WORDS``, any of its languages) or a single
+    capital L/R between words marks the side; the label comes from the words
+    after the marker, else before it, and must be a known part (``CANONICAL``
+    or ``vocab.FOREIGN_PARTS``) — rig words alone never produce a side.
+    Returns ``(side, label)``, or ``('', '')``.
+    """
+    m = _LOWER_SIDE_RE.match(name)
+    if m:
+        label = _part_label([m.group(2)])
+        if label and label != 'Bone':
+            return ('Left' if m.group(1) == 'l' else 'Right'), label
+    tokens = _WORD_RE.findall(name)
+    marks, sides = [], set()
+    for i, tok in enumerate(tokens):
+        side = SIDE_WORDS.get(tok.lower())
+        if side is None and tok in ('L', 'R') and i > 0:
+            side = 'Left' if tok == 'L' else 'Right'
+        if side:
+            marks.append(i)
+            sides.add(side)
+    if len(sides) != 1:
+        return '', ''
+    m = re.search(r'Digit([1-5])', name)
+    if m:
+        return sides.pop(), _FINGER_ORD[m.group(1)] + ' Finger'
+    # Words between markers, those after a marker first (a rig prefix sits
+    # before the side, a Romance-language side after the part).
+    bounds = [-1] + marks + [len(tokens)]
+    segments = [tokens[bounds[k] + 1:bounds[k + 1]] for k in range(len(bounds) - 1)]
+    labels = [_part_label(segment) for segment in segments[1:] + segments[:1]]
+    labels = [label for label in labels if label and label != 'Bone']
+    if not labels:
+        return '', ''
+    if labels[0] == 'End' and len(labels) > 1:
+        # 'ankle_left_tip': the end marker after the side ends the part before it
+        return sides.pop(), f'{labels[1]} End'
+    return sides.pop(), labels[0]
 
 
 def strip_trailing_decorations(name):
@@ -329,7 +437,14 @@ def clean_standard_name(raw):
     if not name:
         return raw.strip("_")
 
+    code_side, label = extract_leg_code(name)
+    if code_side:
+        return with_side(code_side, label)
     side, name = extract_side_prefix(name)
+    if not side:
+        inner_side, label = extract_inner_side(name)
+        if inner_side:
+            return with_side(inner_side, label)
 
     # Numeric finger codes, before the chain-index strip eats the code digit:
     # CMU segments ('Finger1Metacarpal', 1-based) and 3ds Max Biped codes
@@ -346,6 +461,9 @@ def clean_standard_name(raw):
         if m.group(2):
             label += " End"
         return with_side(side, label)
+    m = _DIGIT_CODE_RE.match(name)
+    if m:
+        return with_side(side, _FINGER_ORD[m.group(1)] + " Finger")
 
     # Strip a trailing chain index: "Thigh_4" -> "Thigh", "Spine02" -> "Spine".
     m = re.match(r'^(.+?)_?(\d+)$', name)
@@ -409,13 +527,87 @@ def clean_standard_name(raw):
 _MIXAMORIG_RE = re.compile(r'^mixamorig\d*[:_]', re.IGNORECASE)
 
 
-def clean_joint_name(raw, animal):
+def name_words(raw):
+    """Words of a raw joint name for the learned vocabulary: namespace,
+    Biped prefix, counters and side markers dropped, lower-cased
+    ('mixamorig:LeftUpLeg_012' -> up, leg; 'JNT_Muslo_Der_01' -> jnt, muslo)."""
+    name = _PAREN_DECOR_RE.sub('', raw).strip() or raw
+    name = _FBX_ESCAPE_RE.sub(lambda m: chr(int(m.group(1))), name)
+    name = re.sub(r'^.*:', '', name)
+    name = _BIP_PREFIX_RE.sub('', name)
+    _, name = strip_trailing_decorations(name)
+    words = [w.lower() for w in _WORD_RE.findall(name) if not w.isdigit()]
+    return [w for w in words if w not in SIDE_WORDS and w not in ('l', 'r')]
+
+
+def name_keys(raw):
+    """Lookup keys of a raw name, longest first: its words and every shorter
+    tail of them, so a rig-specific prefix ('doberman_ref_haunch') still
+    reaches a learned tail ('haunch')."""
+    words = name_words(raw)
+    return ['_'.join(words[i:]) for i in range(len(words))]
+
+
+def _learned_vocab(_cache=[]):
+    """``{name_key: part label}`` learned from reviewed annotations
+    (``learned_vocab.json``, written by ``learn_vocab.py``); empty if absent."""
+    if not _cache:
+        path = os.path.join(os.path.dirname(__file__), 'learned_vocab.json')
+        keys = {}
+        if os.path.isfile(path):
+            with open(path) as f:
+                keys = json.load(f).get('keys', {})
+        _cache.append(keys)
+    return _cache[0]
+
+
+def _name_side(raw):
+    bare = _NAMESPACE_RE.sub('', raw) or raw
+    side, _ = extract_side_prefix(_BIP_PREFIX_RE.sub('', bare))
+    return side or extract_inner_side(bare)[0]
+
+
+def clean_joint_name(raw, animal, refine=True):
+    """Clean one joint name: the rules below, then (*refine*) the label
+    refinements the reviewed annotations support:
+
+    - a placeholder or non-canonical label takes the learned vocabulary's part
+      for the name (``learned_vocab.json``), keeping the name's side;
+    - a placeholder keeps the side its name marks ('1.L' -> 'Left Bone');
+    - a name ending in ``END`` / ``_end`` / ``Nub`` is an end bone
+      ('LeftToesEND' -> 'Left Toe End').
+
+    ``refine=False`` is the label set the face resolver uses
+    (``rig_preprocess.annotate.rule_annotation``).
+    """
+    out = _clean_joint_name_rules(raw, animal)
+    if not refine or not raw or not raw.strip():
+        return out
+    cleaned = post_process(out)
+    if cleaned == 'Bone' or not is_canonical_label(cleaned):
+        vocab = _learned_vocab()
+        label = next((vocab[k] for k in name_keys(raw) if k in vocab), None)
+        if label:
+            side = re.match(r'^(Left|Right)\b', cleaned)
+            out = with_side(side.group(1) if side else _name_side(raw), label)
+            cleaned = post_process(out)
+    if cleaned == 'Bone':
+        side, _ = strip_trailing_decorations(_PAREN_DECOR_RE.sub('', raw).strip() or raw)
+        return with_side(side, 'Bone')
+    if (_END_SUFFIX_RE.search(re.sub(r'[._]\d+$', '', raw)) and not cleaned.endswith(' End')
+            and not re.match(r'^_?\d+$', cleaned)):
+        return out + ' End'
+    return out
+
+
+def _clean_joint_name_rules(raw, animal):
     """Main dispatcher for cleaning a single joint name."""
     if not raw or not raw.strip():
         return raw
 
     # Editor bookkeeping suffixes: 'Bone001(mirrored)' -> 'Bone001'
     raw = _PAREN_DECOR_RE.sub("", raw).strip() or raw
+    raw = _FBX_ESCAPE_RE.sub(lambda m: chr(int(m.group(1))), raw)
 
     # Generic "BoneNN" placeholders -> "Bone" (dot forms via clean_standard_name)
     if re.match(r'^Bone\d+$', raw):
@@ -460,6 +652,112 @@ def clean_joint_name(raw, animal):
         return clean_japanese_name(raw)
 
     return clean_standard_name(raw)
+
+
+def limb_context(labels, parents):
+    """Resolve the generic limb words a rig's hierarchy disambiguates (Mixamo
+    convention, which the reviewed labels follow): a ``Leg`` whose parent is
+    a ``Thigh`` is the shin; an ``Arm`` with a ``Forearm`` child is the upper
+    arm. Returns a new list."""
+    def part(label):
+        return re.sub(r'^(Left|Right) ', '', label)
+
+    def side(label):
+        m = re.match(r'^(Left|Right) ', label)
+        return m.group(1) if m else ''
+
+    out = list(labels)
+    for j, label in enumerate(labels):
+        p = int(parents[j])
+        if part(label) == 'Leg' and p >= 0 and part(labels[p]) == 'Thigh':
+            out[j] = with_side(side(label), 'Shin')
+        elif part(label) == 'Arm' and any(int(parents[k]) == j and part(labels[k]) == 'Forearm'
+                                          for k in range(len(labels))):
+            out[j] = with_side(side(label), 'Upper Arm')
+    return quadruped_leg_chains(out, parents)
+
+
+# Segment labels of a quadruped leg chain, root to tip, in the Truebones
+# convention the reviewed labels follow: hind legs by chain length, front
+# legs after an optional shoulder (a paw tip is a 'Thumb Finger').
+_HIND_CHAINS = {1: ['Thigh'], 2: ['Thigh', 'Shin'], 3: ['Thigh', 'Shin', 'Foot'],
+                4: ['Thigh', 'Shin', 'Fetlock', 'Foot']}
+_HIND_LONG = ['Thigh', 'Shin', 'Fetlock', 'Foot', 'Toe']
+_FRONT_CHAIN = ['Upper Arm', 'Forearm', 'Hand', 'Thumb Finger']
+_LEG_SEGMENT_RE = re.compile(r'^(Left|Right) (Front|Back|Hind|Rear) Leg\b(.*)$')
+
+
+def _chain_labels(template, n):
+    return [template[min(i, len(template) - 1)] for i in range(n)]
+
+
+def quadruped_leg_chains(labels, parents):
+    """Relabel leg chains named by position rather than by part
+    (``Back_Leg_Upper_L`` -> 'Left Back Leg Upper'): every non-canonical
+    '<Side> <Front|Back> Leg ...' joint, the joints of its chain (single
+    same-side children below, a same-side Shoulder / Hips-like joint above)
+    get the segment labels of their position in the chain, except joints
+    that already carry a canonical part label. Chains with no such joint are
+    left alone. Returns a new list."""
+    parents = [int(p) for p in parents]
+    children = {}
+    for j, p in enumerate(parents):
+        children.setdefault(p, []).append(j)
+    out = list(labels)
+    done = set()
+    for j, label in enumerate(labels):
+        m = _LEG_SEGMENT_RE.match(label)
+        if j in done or not m or is_canonical_label(label):
+            continue
+        side, front = m.group(1), m.group(2) == 'Front'
+        top = j                       # climb to the chain's first leg-segment joint
+        while parents[top] >= 0:
+            pm = _LEG_SEGMENT_RE.match(labels[parents[top]])
+            if not (pm and pm.group(1) == side and (pm.group(2) == 'Front') == front):
+                break
+            top = parents[top]
+        p = parents[top]
+        if front and p >= 0 and labels[p] in (f'{side} Shoulder', f'{side} Clavicle'):
+            top = p
+        chain = [top]
+        while True:
+            kids = [k for k in children.get(chain[-1], [])
+                    if labels[k].startswith(side + ' ')]
+            if len(kids) != 1:
+                break
+            chain.append(kids[0])
+        done.update(chain)
+        ends = [labels[k].endswith(' End') for k in chain]
+        core = [k for k, e in zip(chain, ends) if not e]
+        if not core:
+            continue
+        if front:
+            # A shoulder-like first joint, or one more joint than the arm
+            # template names before the paw tip, is the shoulder.
+            shoulder = (any(w in labels[core[0]] for w in ('Shoulder', 'Clavicle', 'Scapula'))
+                        or len(core) > len(_FRONT_CHAIN))
+            names = (['Shoulder'] if shoulder else []) + _chain_labels(
+                _FRONT_CHAIN, len(core) - shoulder)
+        else:
+            names = _HIND_CHAINS.get(len(core)) or _chain_labels(_HIND_LONG, len(core))
+        last = None
+        for k, e in zip(chain, ends):
+            if e:
+                if last and _replaceable(labels[k][:-len(' End')]):
+                    out[k] = with_side(side, f'{last} End')
+            else:
+                last = names.pop(0)
+                if _replaceable(labels[k]):
+                    out[k] = with_side(side, last)
+                else:
+                    last = re.sub(r'^(Left|Right) ', '', labels[k])
+    return out
+
+
+def _replaceable(label):
+    """A chain joint's label the position label replaces: a positional leg
+    name or any non-canonical one; a canonical part label is kept."""
+    return bool(_LEG_SEGMENT_RE.match(label)) or not is_canonical_label(label)
 
 
 # ---------------------------------------------------------------------------

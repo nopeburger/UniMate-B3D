@@ -39,6 +39,25 @@ handle_help() {
     esac
 }
 
+# add_asset_args : append the sampler's asset flags to the wrapper's CMD array:
+# --asset for each of $ASSETS, --cond_path for each of $COND_PATH (both
+# space-separated), --cond_dataset_type $COND_DATASET_TYPE. (ASSETS, plural:
+# ASSET is the stage-5 character kind of the animate wrappers.)
+add_asset_args() {
+    local _items
+    if [[ -n "${ASSETS:-}" ]]; then read -r -a _items <<< "$ASSETS"; CMD+=(--asset "${_items[@]}"); fi
+    if [[ -n "${COND_PATH:-}" ]]; then read -r -a _items <<< "$COND_PATH"; CMD+=(--cond_path "${_items[@]}"); fi
+    if [[ -n "${COND_DATASET_TYPE:-}" ]]; then CMD+=(--cond_dataset_type "$COND_DATASET_TYPE"); fi
+    return 0
+}
+
+# add_prompt_args : append --prompt with the '|'-separated prompts of $PROMPT to CMD.
+add_prompt_args() {
+    local _prompts
+    if [[ -n "${PROMPT:-}" ]]; then IFS='|' read -r -a _prompts <<< "$PROMPT"; CMD+=(--prompt "${_prompts[@]}"); fi
+    return 0
+}
+
 # select_gpu : unless CUDA_VISIBLE_DEVICES is already set, pin the run to the
 # GPU with the most free memory. No-op when nvidia-smi is unavailable.
 select_gpu() {

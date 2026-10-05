@@ -1,12 +1,14 @@
 """Process exported NPZ motions into canonicalized training clips.
 
-Supports three dataset layouts via ``--dataset_type``:
+Supports four dataset layouts via ``--dataset_type``:
 
 - ``truebones``: per-object NPZ files under ``data_dir/motions``, named
   ``{object_type}-{motion}.npz``. Object types are discovered from filename
   prefixes.
 - ``objaverse``: same layout as truebones, plus an optional
   ``filtered_objects.txt`` listing object types to skip.
+- ``general``: extra assets of your own (``dataset/raw/general/animation``, exported by
+  ``export_general.py``); processed exactly like ``objaverse``.
 - ``mixamo``: single skeleton / object type. All NPZs live directly under
   ``data_dir/motions`` with no ``{object_type}-`` prefix; caption keys are
   bare motion stems.
@@ -20,14 +22,21 @@ three are generated from the hand-reviewed patches by
 
 Stage-2 (captions, category groups) and stage-3 (clean / face joint names)
 metadata JSONs are read from ``data_dir`` — see
-:mod:`data_process.feature_extraction.metadata`.
+:mod:`data_process.feature_extraction.metadata`. Every clip has up to three
+captions: the normal one (``motion_captions.json`` -> ``captions.json``;
+a clip without one is still saved, but left out of ``captions.json``, and the
+training loader skips it) and, when the export has them, a short
+generic and a longer detail one (``motion_captions_<v>.json`` ->
+``captions_<v>.json``, see ``--generic_captions`` / ``--detail_captions``).
+Training can sample any of them per step.
 
 Object types are independent, so they can be processed in parallel
 (``--num_workers``) and are resumable: each finished object type caches its
 result under ``<save_dir>/cond_parts/`` and is skipped on rerun. The cache
-records the clip / threshold / topology settings it was built with and is
-re-processed automatically when they change; delete ``cond_parts/`` (or one
-entry) to force re-processing for any other reason.
+records the clip / threshold / topology settings and the export files (name,
+size, mtime) it was built from and is re-processed automatically when they
+change; delete ``cond_parts/`` (or one entry) to force re-processing for any
+other reason.
 
 Object types that fail are logged to ``<save_dir>/extract_errors.log``,
 recorded in ``filtered_clips.json`` and skipped (no cache entry is written,
@@ -53,6 +62,7 @@ from loguru import logger
 from tqdm import tqdm
 
 from data_process.feature_extraction.metadata import (
+    EXTRA_CAPTION_VERSIONS,
     MIXAMO_CORE_JOINTS,
     atomic_np_save,
     build_stats,
@@ -72,12 +82,13 @@ from data_process.utils.motion_features import process_object
 MIXAMO_OBJECT_TYPE = 'mixamo'
 
 
-def parse_args():
+def parse_args(argv=None):
+    """Stage-4 arguments from *argv* (default: the command line)."""
     parser = argparse.ArgumentParser(
         description="Process exported NPZ motions into canonicalized training clips.")
     # Dataset selection
     parser.add_argument("--dataset_type", type=str, required=True,
-                        choices=['truebones', 'objaverse', 'mixamo'],
+                        choices=['truebones', 'objaverse', 'mixamo', 'general'],
                         help="Which dataset layout to process")
     # Directories
     parser.add_argument("--data_dir", type=str, required=True,
@@ -123,8 +134,9 @@ def parse_args():
                              "is static; leading/trailing static frames are trimmed")
     parser.add_argument("--jump_step_threshold", type=float, default=0.2,
                         help="Discontinuity filter: a clip is dropped when one "
-                             "frame moves the skeleton at least this many body "
-                             "lengths AND that step is at least "
+                             "frame moves the skeleton at least this many clip "
+                             "extents (the box the clip sweeps, root travel "
+                             "included) AND that step is at least "
                              "--jump_ratio_threshold times the clip median "
                              "(concatenated actions / teleports). 0 disables.")
     parser.add_argument("--jump_ratio_threshold", type=float, default=8.0,
@@ -157,7 +169,7 @@ def parse_args():
                              "any object is processed, so they do NOT appear in "
                              "filtered_clips.json (which records runtime filters).")
     parser.add_argument("--filtered_objects", type=str, default="auto",
-                        help="(objaverse only) Path to a txt file listing object "
+                        help="(objaverse / general) Path to a txt file listing object "
                              "types to skip (one per line; blanks and '#' comments "
                              "ignored). Default 'auto' uses "
                              "<data_dir>/filtered_objects.txt if present. Pass an "
@@ -178,6 +190,21 @@ def parse_args():
                              "turn or a wave. Default 'auto' uses "
                              "<data_dir>/activity_keep.txt if present. Pass an empty "
                              "string to disable.")
+    parser.add_argument("--generic_captions", type=str, default="auto",
+                        help="JSON {export clip: generic caption}, the second "
+                             "caption of every clip (written by "
+                             "tools/patch_annotations.py). Default 'auto' uses "
+                             "<data_dir>/motion_captions_generic.json if present. "
+                             "Saved as captions_generic.json beside captions.json, "
+                             "keyed the same way. Pass an empty string to disable "
+                             "(a stale captions_generic.json is then removed). "
+                             "Not part of the per-object cache: changing it never "
+                             "re-processes an object.")
+    parser.add_argument("--detail_captions", type=str, default="auto",
+                        help="Like --generic_captions for the third, detail "
+                             "caption (7-19 words): default 'auto' uses "
+                             "<data_dir>/motion_captions_detail.json if present, "
+                             "saved as captions_detail.json.")
     parser.add_argument("--category_groups", type=str, default="auto",
                         help="Path to the body-plan category JSON copied into "
                              "the feature dir (the training loader reads it for "
@@ -199,7 +226,18 @@ def parse_args():
                              "follow camera, contact shadow and root "
                              "trajectory (default). --no-vis_ground renders "
                              "the plain cubic view instead.")
-    return parser.parse_args()
+    parser.add_argument("--save_glb", action="store_true",
+                        help="Afterwards bake <data_dir>/rigs/<asset>.glb (the export stage's "
+                             "rest-pose assets, run_export.sh --save_glb / --glb_only) into the "
+                             "canonical frame: <canonical_assets_dir>/<object_type>.glb, driven "
+                             "by the feature clips with no cond.npy (canonical_assets.py; needs "
+                             "bpy; one process, so shard canonical_assets.py for a large dataset).")
+    parser.add_argument("--canonical_assets_dir", type=str, default=None,
+                        help="Where --save_glb writes (default: canonical_assets/<dataset> "
+                             "beside the features root, e.g. dataset/canonical_assets/truebones "
+                             "for dataset/features/truebones; <save_dir>_canonical_assets for "
+                             "a save_dir outside a features root).")
+    return parser.parse_args(argv)
 
 
 def _resolve_skip_list_path(path, data_dir, filename):
@@ -237,6 +275,30 @@ def resolve_clip_trims_path(path, data_dir):
 
 def resolve_activity_keep_path(path, data_dir):
     return _resolve_skip_list_path(path, data_dir, 'activity_keep.txt')
+
+
+def resolve_extra_captions(path, data_dir, version):
+    """Load the *version* captions named by ``--<version>_captions`` (or None).
+
+    ``"auto"`` uses ``<data_dir>/motion_captions_<version>.json`` when present
+    and an empty string disables them; both then remove a stale
+    ``captions_<version>.json``. An explicit path that does not exist raises
+    instead: a typo must not silently delete the captions already in the
+    feature directory.
+    """
+    name = f'motion_captions_{version}.json'
+    if path == 'auto':
+        path = pjoin(data_dir, name)
+        if not os.path.isfile(path):
+            logger.info(f'No {name} in {data_dir}; no captions_{version}.json this run')
+            return None
+    elif not path:
+        return None
+    elif not os.path.isfile(path):
+        raise FileNotFoundError(f'--{version}_captions {path!r} does not exist')
+    captions = load_json(path)
+    logger.info(f'{version.capitalize()} captions: {len(captions)} from {path}')
+    return captions
 
 
 def load_clip_trims(path):
@@ -324,7 +386,7 @@ def discover_object_types(motion_dir, dataset_type, args):
     object_types = sorted(set(m.split('-')[0] for m in all_motions))
     logger.info(f'Found {len(all_motions)} motion files, {len(object_types)} object types')
 
-    if dataset_type == 'objaverse':
+    if dataset_type in ('objaverse', 'general'):
         filtered_path = resolve_filtered_objects_path(args.filtered_objects, args.data_dir)
         filtered_object_types = load_filtered_objects(filtered_path)
         if filtered_object_types:
@@ -420,26 +482,31 @@ def _cache_params(task):
     # re-processes exactly the owning object type.
     if task.get('root_offsets'):
         params['root_offsets_digest'] = _digest(task['root_offsets'])
+    # Rest orientation fixes are baked into the NPZs the same way.
+    if task.get('rest_orientations'):
+        params['rest_orientations_digest'] = _digest(task['rest_orientations'])
     return params
 
 
 # Written into an export NPZ by tools/patch_annotations.py (apply_root_offsets)
 # when it bakes a root orientation fix in; keep the name in sync.
 ROOT_OFFSET_KEY = 'root_offset_applied'
+# Written by tools/patch_annotations.py (apply_rest_orientations); keep in sync.
+REST_ORIENTATION_KEY = 'rest_orientation_applied'
 
 
-def read_root_offsets(object_npzs):
+def read_root_offsets(object_npzs, key=ROOT_OFFSET_KEY):
     """``{clip stem: [w, x, y, z]}`` for the export NPZs carrying a baked-in
-    root offset. Only the zip directory is read for the others, so this stays
-    cheap over a whole dataset."""
+    fix under *key* (a root offset by default, or a rest orientation). Only the
+    zip directory is read for the others, so this stays cheap over a whole
+    dataset."""
     offsets = {}
     for path in object_npzs:
         with zipfile.ZipFile(path) as zf:
-            if ROOT_OFFSET_KEY + '.npy' not in zf.namelist():
+            if key + '.npy' not in zf.namelist():
                 continue
         with np.load(path) as d:
-            offsets[os.path.basename(path)[:-4]] = [
-                round(float(x), 6) for x in d[ROOT_OFFSET_KEY]]
+            offsets[os.path.basename(path)[:-4]] = [round(float(x), 6) for x in d[key]]
     return offsets
 
 
@@ -449,8 +516,23 @@ def _params_hash(params):
     return hashlib.sha1(blob.encode('utf-8')).hexdigest()
 
 
-def _load_cached_result(part_path, object_type, params, params_hash):
-    """Return a cached object result, or None when absent / stale / unreadable."""
+def _export_digest(task):
+    """Digest of the inputs the settings hash cannot see: each clip NPZ's name,
+    size and mtime (a re-export under the same clip names) and the object's
+    ``joint_names.json`` entry (its order drives the clean-name realignment).
+    Kept beside ``params_hash`` rather than in it (see :func:`_load_cached_result`)."""
+    files = []
+    for path in sorted(task['object_npzs']):
+        st = os.stat(path)
+        files.append([os.path.basename(path), st.st_size, st.st_mtime_ns])
+    return _digest([files, task.get('expected_names')])
+
+
+def _load_cached_result(part_path, object_type, params, params_hash, export_digest):
+    """Return a cached object result, or None when absent / stale / unreadable.
+
+    An entry without an ``export_digest`` is taken as built from the current
+    export and stamped with its digest."""
     if not os.path.isfile(part_path):
         return None
     try:
@@ -465,7 +547,16 @@ def _load_cached_result(part_path, object_type, params, params_hash):
                     f'tracking); re-processing')
         return None
     if payload['params_hash'] == params_hash:
-        return payload.get('result')
+        cached_digest = payload.get('export_digest')
+        if cached_digest is None:
+            payload['export_digest'] = export_digest
+            atomic_np_save(part_path, payload)
+            return payload.get('result')
+        if cached_digest == export_digest:
+            return payload.get('result')
+        logger.info(f'[{object_type}] cache invalidated (export NPZs or joint_names.json '
+                    f'entry changed); re-processing')
+        return None
 
     cached_params = payload.get('params') or {}
     diff = ', '.join(
@@ -527,9 +618,11 @@ def process_object_task(task):
     clip_prefix = task.pop('clip_prefix')
     params = _cache_params(task)
     params_hash = _params_hash(params)
+    export_digest = _export_digest(task)
     task.pop('root_offsets', None)   # cache key only; process_object reads the NPZs
+    task.pop('rest_orientations', None)
 
-    cached = _load_cached_result(part_path, object_type, params, params_hash)
+    cached = _load_cached_result(part_path, object_type, params, params_hash, export_digest)
     if cached is not None:
         return object_type, cached, True
 
@@ -562,7 +655,7 @@ def process_object_task(task):
     # entry behind (unreadable ones are treated as misses, but this keeps them
     # from happening in the first place).
     atomic_np_save(part_path, {'params_hash': params_hash, 'params': params,
-                               'result': result})
+                               'export_digest': export_digest, 'result': result})
     return object_type, result, False
 
 
@@ -614,6 +707,7 @@ def build_object_tasks(args, clip_stride, motion_dir, metadata):
             head_trims=head_trims,
             activity_keep=keep,
             root_offsets=read_root_offsets(object_npzs),
+            rest_orientations=read_root_offsets(object_npzs, key=REST_ORIENTATION_KEY),
             # Mixamo clip files carry no "{object_type}-" prefix; its single
             # object type owns the whole directory.
             clip_prefix=('' if args.dataset_type == 'mixamo'
@@ -665,6 +759,9 @@ def main(args):
                 + ', '.join(f'{k}={len(v)}' for k, v in metadata.items()))
     check_metadata_object_types_consistent(metadata)
     category_groups = resolve_category_groups(args.category_groups, metadata)
+    # Resolved up front so a bad --<v>_captions path fails before any work.
+    extra_captions = {v: resolve_extra_captions(getattr(args, f'{v}_captions'), args.data_dir, v)
+                      for v in EXTRA_CAPTION_VERSIONS}
 
     tasks = build_object_tasks(args, clip_stride, motion_dir, metadata)
 
@@ -714,11 +811,21 @@ def main(args):
                      + ', '.join(sorted(failed_objects)))
 
     all_captions = save_outputs(args.save_dir, cond, all_filtered_clips,
-                                category_groups=category_groups)
+                                category_groups=category_groups,
+                                extra_captions=extra_captions)
     stats = build_stats(clips_per_object, joints_per_object, total_frames, max_njoints)
     print_summary(stats)
     save_metadata_report(args.save_dir, stats, all_filtered_clips,
                          all_captions=all_captions, category_groups=category_groups)
+    if args.save_glb:
+        # bpy only here, so the stage itself stays Blender-free.
+        from data_process.feature_extraction.canonical_assets import bake_canonical_assets
+        glb_counts = bake_canonical_assets(args.data_dir, args.save_dir,
+                                           assets_dir=args.canonical_assets_dir,
+                                           dataset_type=args.dataset_type)
+        if glb_counts['failed']:
+            logger.error(f"{glb_counts['failed']} canonical GLB(s) failed; see glb_errors/ in "
+                         f"the canonical_assets directory (the features are complete)")
     logger.info('Dataset processing complete.')
 
 

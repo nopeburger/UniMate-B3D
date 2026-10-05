@@ -428,8 +428,8 @@ def find_shard_paths(output_json):
     """Every ``<base>.shard<N><ext>`` file sitting next to ``output_json``.
 
     Globbing (rather than trusting a ``num_gpus`` argument) means a merge
-    run launched with fewer GPUs than the run that produced the shards can
-    no longer silently drop the extra shards.
+    run launched with fewer GPUs than the run that produced the shards does
+    not drop the extra shards.
     """
     base, ext = os.path.splitext(output_json)
     pattern = "{}.shard*{}".format(os.path.basename(base), ext)
@@ -449,9 +449,10 @@ def merge_shards(output_json, num_gpus=None):
     """Merge per-GPU shard files into a single output JSON.
 
     Loads every ``output_json.shard*`` file found next to ``output_json``,
-    merges them on top of the existing ``output_json`` contents, and writes
-    the combined result back. ``num_gpus`` is only used to warn when fewer
-    shards than expected are present.
+    merges them on top of the existing ``output_json`` contents, writes
+    the combined result back and renames the merged shards ``*.merged``.
+    ``num_gpus`` is only used to warn when fewer shards than expected are
+    present.
 
     Returns:
         The merged dict.
@@ -505,6 +506,14 @@ def merge_shards(output_json, num_gpus=None):
             f.write("\n".join(sorted(failed)) + ("\n" if failed else ""))
         logger.info("Merged failure lists -> {} pending clips in {}".format(
             len(failed), failed_out))
+
+    # Merged shards step aside (renamed ``*.merged``, out of the glob): left
+    # in place they would win over ``output_json`` again at the next merge
+    # and resume, undoing later edits such as patched or deleted captions.
+    for spath in shard_paths:
+        for path in (spath, os.path.splitext(spath)[0] + "_failed.txt"):
+            if os.path.exists(path):
+                os.replace(path, path + ".merged")
     return merged
 
 

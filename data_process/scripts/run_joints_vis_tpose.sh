@@ -31,7 +31,7 @@ if [[ -n "${NPZ_PATH:-}" ]]; then
     cmd+=(--npz_path "$NPZ_PATH")
     [[ -n "${OUTPUT_PATH:-}" ]] && cmd+=(--output "$OUTPUT_PATH")
 else
-    DATASET=${1:?Usage: run_joints_vis_tpose.sh <truebones|mixamo|objaverse>  (or set NPZ_PATH)}
+    DATASET=${1:?Usage: run_joints_vis_tpose.sh <truebones|mixamo|objaverse|general>  (or set NPZ_PATH)}
     require_dataset "$DATASET"
     MOTIONS_DIR=${MOTIONS_DIR:-$(export_dir "$DATASET")/motions}
     OUTPUT_DIR=${OUTPUT_DIR:-$(export_dir "$DATASET")/face_joints_vis}

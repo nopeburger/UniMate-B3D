@@ -158,8 +158,8 @@ def generate_openai(system_prompt, user_prompt, model_name, api_key, base_url,
         # DeepSeek V4 thinks by default (effort 'high') and the reasoning
         # tokens count against max_tokens. Effort 'none' disables thinking —
         # but V4-Flash WITHOUT thinking drifts on long batched arrays
-        # (systematic label/side misalignment on ~10% of truebones rigs,
-        # A/B'd 2026-08-30), so default to the cheapest thinking tier.
+        # (systematic label/side misalignment on ~10% of truebones rigs in
+        # an A/B test), so default to the cheapest thinking tier.
         # Thinking mode ignores temperature.
         kwargs["reasoning_effort"] = reasoning_effort or "low"
         if kwargs["reasoning_effort"] == "none":
@@ -311,8 +311,12 @@ class FatalLLMError(Exception):
     rig of a batch run to rule-based output."""
 
 
-class RigTimeout(Exception):
-    """Raised by the per-rig SIGALRM handler to abort an over-budget rig."""
+class RigTimeout(BaseException):
+    """Raised by the per-rig SIGALRM handler to abort an over-budget rig.
+
+    A ``BaseException``: the alarm usually fires inside the HTTP client, whose
+    ``except Exception`` would otherwise catch it and retry the request with no
+    budget left. Callers catch it by name."""
 
 
 def _alarm_handler(signum, frame):

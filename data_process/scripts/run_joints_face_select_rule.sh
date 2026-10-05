@@ -3,7 +3,7 @@
 # Reads joint_names.json + clean_joint_names.json from the export directory.
 #
 # Usage:
-#   bash data_process/scripts/run_joints_face_select_rule.sh <truebones|mixamo|objaverse>
+#   bash data_process/scripts/run_joints_face_select_rule.sh <truebones|mixamo|objaverse|general>
 #
 # Env overrides: INPUT_DIR, OUTPUT
 
@@ -12,7 +12,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
 handle_help "$@"
 
-DATASET=${1:?Usage: run_joints_face_select_rule.sh <truebones|mixamo|objaverse> [extra args...]}
+DATASET=${1:?Usage: run_joints_face_select_rule.sh <truebones|mixamo|objaverse|general> [extra args...]}
 shift
 require_dataset "$DATASET"
 

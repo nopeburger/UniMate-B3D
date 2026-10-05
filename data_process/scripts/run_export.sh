@@ -7,16 +7,26 @@
 #   bash data_process/scripts/run_export.sh objaverse           # dataset preset (GLB/GLTF)
 #   bash data_process/scripts/run_export.sh objaverse --multi-worker 8   # parallel (mixamo too)
 #   bash data_process/scripts/run_export.sh mixamo --multi-worker 8 --no-vis   # skip MP4 previews
-#   DATA_DIR=my_assets bash data_process/scripts/run_export.sh  # auto: .glb/.gltf and .fbx side by side
+#   bash data_process/scripts/run_export.sh general --multi-worker 8     # your extra assets
+#   DATA_DIR=my_assets bash data_process/scripts/run_export.sh general   # ... from another folder
+#   bash data_process/scripts/run_export.sh truebones --save_glb   # + rigs/<asset>.glb (rest pose, no animation)
+#   bash data_process/scripts/run_export.sh truebones --glb_only   # only add missing GLBs to an existing export
 #
 # --multi-worker only applies to a *directory* input; truebones is exported by
-# a single-process exporter and ignores it (with a warning).
+# a single-process exporter and ignores it (with a warning), except under
+# --glb_only, which shards its species.
 #
-# Auto mode runs export_general.py on the directory: GLB/GLTF and FBX side
-# by side, importer picked per file by extension, mesh optional (armature-only
-# FBX works too).
+# general is extra training data of your own: one rigged asset per file in
+# dataset/raw/general/animation/ (objaverse-style GLB/GLTF, each animation a
+# clip; FBX side by side works too),
+# exported by export_general.py to dataset/export/general. The importer is
+# picked per file by extension, the mesh is optional (armature-only FBX works,
+# but only meshed assets can be rendered and captioned later), and the asset
+# name is the file stem with '-' and whitespace replaced by '_'. Calling the
+# script without a dataset (or with `auto`, an alias) means general.
 #
-# Env overrides: DATA_DIR, OUTPUT_DIR
+# Env overrides: DATA_DIR, OUTPUT_DIR, CHAR_DIR (mixamo: the characters whose
+# GLBs --save_glb / --glb_only write; default dataset/raw/mixamo/character_refined)
 # Extra arguments are passed through to the exporter.
 
 set -euo pipefail
@@ -27,23 +37,26 @@ EXPORTERS=data_process/motion_export
 # ── Parse mode + flags ───────────────────────────────────────────────────────
 handle_help "$@"
 
-MODE=auto
+MODE=general
 case "${1:-}" in
-    truebones|mixamo|objaverse|auto) MODE="$1"; shift ;;
-    ""|--*) ;;   # no dataset given: auto mode (DATA_DIR required), flags follow
+    truebones|mixamo|objaverse|general) MODE="$1"; shift ;;
+    auto) MODE=general; shift ;;   # alias of general
+    ""|--*) ;;   # no dataset given: general, flags follow
     *)
         # A bare word that is not a dataset name is almost always a typo;
-        # silently treating it as an exporter flag would land in auto mode
-        # and fail later on a missing DATA_DIR.
-        echo "ERROR: unknown dataset '$1' (expected truebones | mixamo | objaverse | auto)" >&2
+        # silently treating it as an exporter flag would export the general
+        # dataset instead.
+        echo "ERROR: unknown dataset '$1' (expected truebones | mixamo | objaverse | general)" >&2
         exit 2 ;;
 esac
 
 NUM_WORKERS=1
+GLB_ONLY=0
 EXTRA_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --multi-worker) NUM_WORKERS="${2:?--multi-worker requires a value}"; shift 2 ;;
+        --glb_only) GLB_ONLY=1; EXTRA_ARGS+=("$1"); shift ;;
         *) EXTRA_ARGS+=("$1"); shift ;;
     esac
 done
@@ -55,13 +68,25 @@ case "$MODE" in
         OUTPUT_DIR=${OUTPUT_DIR:-$(export_dir truebones)} ;;
     mixamo)
         DATA_DIR=${DATA_DIR:-dataset/raw/mixamo/animation_motion}
-        OUTPUT_DIR=${OUTPUT_DIR:-$(export_dir mixamo)} ;;
+        OUTPUT_DIR=${OUTPUT_DIR:-$(export_dir mixamo)}
+        # The characters the processed GLBs are made of (--save_glb / --glb_only).
+        CHAR_DIR=${CHAR_DIR:-dataset/raw/mixamo/character_refined} ;;
     objaverse)
         DATA_DIR=${DATA_DIR:-dataset/raw/objaverse/glb}
         OUTPUT_DIR=${OUTPUT_DIR:-$(export_dir objaverse)} ;;
-    auto)
-        DATA_DIR=${DATA_DIR:?auto mode requires DATA_DIR (directory of .glb/.gltf/.fbx assets)}
-        OUTPUT_DIR=${OUTPUT_DIR:-$(export_dir custom)} ;;
+    general)
+        DATA_DIR=${DATA_DIR:-$GENERAL_RAW_DIR}
+        OUTPUT_DIR=${OUTPUT_DIR:-$(export_dir general)}
+        if [[ ! -e "$DATA_DIR" ]]; then
+            echo "ERROR: $DATA_DIR does not exist; put your rigged assets there" \
+                 "(one .glb per object) or set DATA_DIR." >&2
+            exit 2
+        fi
+        if [[ "$(realpath -m "$DATA_DIR")" != "$(realpath -m "$GENERAL_RAW_DIR")" ]]; then
+            echo "NOTE: general assets from $DATA_DIR: pass the same DATA_DIR to" \
+                 "run_render_motion.sh and run_render_tpose.sh, which read $GENERAL_RAW_DIR" \
+                 "by default (a clip without renders gets no caption and stage 4 drops it)."
+        fi ;;
 esac
 
 # ── Exporter invocations ─────────────────────────────────────────────────────
@@ -78,7 +103,7 @@ launch_workers() {
         echo "Launching $NUM_WORKERS export workers (per-worker logs: $log_dir)..."
         local pids=() worker_id failed=0
         for worker_id in $(seq 0 $((NUM_WORKERS - 1))); do
-            blender -b -P "$EXPORTERS/$script" -- \
+            blender -b --python-exit-code 1 -P "$EXPORTERS/$script" -- \
                 "$input_flag=$DATA_DIR" --output_dir="$OUTPUT_DIR" \
                 --worker_id="$worker_id" --num_workers="$NUM_WORKERS" \
                 "${EXTRA_ARGS[@]}" > >(tee "$log_dir/worker${worker_id}.log") 2>&1 &
@@ -99,6 +124,10 @@ launch_workers() {
             echo "then merge with: python -m data_process.tools.merge_summaries --output_dir=$OUTPUT_DIR" >&2
             exit 1
         fi
+        if [[ "$GLB_ONLY" == 1 ]]; then
+            echo "All workers finished (--glb_only: no summaries to merge)."
+            return
+        fi
         echo "All workers finished. Merging summary JSONs..."
         python -m data_process.tools.merge_summaries --output_dir="$OUTPUT_DIR"
     else
@@ -106,20 +135,31 @@ launch_workers() {
             echo "WARNING: --multi-worker is ignored for a single-file input" \
                  "($DATA_DIR); running one exporter process." >&2
         fi
-        blender -b -P "$EXPORTERS/$script" -- \
+        blender -b --python-exit-code 1 -P "$EXPORTERS/$script" -- \
             "$input_flag=$DATA_DIR" --output_dir="$OUTPUT_DIR" "${EXTRA_ARGS[@]}"
     fi
 }
 
 export_glb()    { launch_workers export_objaverse.py --data_dir; }
-export_mixamo() { launch_workers export_mixamo.py --anim_dir; }
+export_mixamo() {
+    case " ${EXTRA_ARGS[*]} " in
+        # Default first: an explicit --char_dir later in the arguments wins.
+        *" --save_glb "*|*" --glb_only "*) EXTRA_ARGS=(--char_dir="$CHAR_DIR" "${EXTRA_ARGS[@]}") ;;
+    esac
+    launch_workers export_mixamo.py --anim_dir
+}
 
 export_fbx() {
+    # A GLB-only run writes per-clip files only, so its species can be sharded.
+    if [[ "$GLB_ONLY" == 1 && "$NUM_WORKERS" -gt 1 ]]; then
+        launch_workers export_truebones.py --data_dir
+        return
+    fi
     if [[ "$NUM_WORKERS" -gt 1 ]]; then
         echo "WARNING: --multi-worker is ignored for truebones — export_truebones.py" \
-             "is single-process; running one exporter process." >&2
+             "is single-process; running one exporter process (except with --glb_only)." >&2
     fi
-    blender -b -P "$EXPORTERS/export_truebones.py" -- \
+    blender -b --python-exit-code 1 -P "$EXPORTERS/export_truebones.py" -- \
         --data_dir="$DATA_DIR" --output_dir="$OUTPUT_DIR" "$@" "${EXTRA_ARGS[@]}"
 }
 
@@ -129,5 +169,5 @@ case "$MODE" in
     objaverse) export_glb ;;
     mixamo)    export_mixamo ;;
     truebones) export_fbx ;;
-    auto)      launch_workers export_general.py --input ;;
+    general)   launch_workers export_general.py --input ;;
 esac

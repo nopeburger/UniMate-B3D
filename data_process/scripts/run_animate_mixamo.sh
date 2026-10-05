@@ -29,7 +29,7 @@ NPZ_DIR=${NPZ_DIR:-$(export_dir mixamo)/motions}
 OUTPUT_DIR=${OUTPUT_DIR:-outputs/mixamo_characters}
 CHAR_ANIM_TYPE=${CHAR_ANIM_TYPE:-fbx}
 
-blender -b -P data_process/mesh_animation/animate_mixamo.py -- \
+blender -b --python-exit-code 1 -P data_process/mesh_animation/animate_mixamo.py -- \
     --char_path="$CHAR_PATH" \
     --npz_dir="$NPZ_DIR" \
     --output_dir="$OUTPUT_DIR" \

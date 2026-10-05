@@ -18,7 +18,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
 handle_help "$@"
 
-DATASET=${1:?Usage: run_joints_face_correct_llm.sh <truebones|mixamo|objaverse> [extra args...]}
+DATASET=${1:?Usage: run_joints_face_correct_llm.sh <truebones|mixamo|objaverse|general> [extra args...]}
 shift
 require_dataset "$DATASET"
 
