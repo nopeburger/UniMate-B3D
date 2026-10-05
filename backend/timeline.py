@@ -65,6 +65,8 @@ def to_local(rotations, parents):
     return local
 
 
+LIMB_SMOOTHING=.25  # share of the smoothing applied to contact limbs
+
 def smooth_motion(positions, rotations, skeleton, sigma):
     """Gaussian-smooth every joint's local rotation and the root path over time.
     sigma is in frames; 0 returns the motion unchanged."""
@@ -78,7 +80,13 @@ def smooth_motion(positions, rotations, skeleton, sigma):
     for t in range(1,frames):  # keep neighbouring frames in one hemisphere
         flip=np.einsum("jk,jk->j",quat[t],quat[t-1])<0
         quat[t][flip]*=-1
-    quat=gaussian_filter1d(quat,sigma,axis=0,mode="nearest")
+    base=quat
+    quat=gaussian_filter1d(base,sigma,axis=0,mode="nearest")
+    # Contact limbs (foot, shin, thigh) get a fraction of the smoothing: their swing
+    # is the gait, and smoothing it as hard leaves the legs barely moving.
+    limbs=sorted({k for f in skeleton.get("foot_profiles",[]) for k in (f.get("joint"),f.get("parent"),f.get("upper")) if k is not None and k>=0})
+    if limbs:
+        quat[:,limbs]=gaussian_filter1d(base[:,limbs],sigma*LIMB_SMOOTHING,axis=0,mode="nearest")
     quat/=np.linalg.norm(quat,axis=-1,keepdims=True)
     local=Rotation.from_quat(quat.reshape(-1,4)).as_matrix().reshape(frames,joints,3,3)
     root=gaussian_filter1d(positions[:,0],sigma,axis=0,mode="nearest")
