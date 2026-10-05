@@ -39,12 +39,12 @@ class UniMateSettings(bpy.types.PropertyGroup):
         ("auto", "Auto", "Keep limbs from passing through the body; off for rigs with five or more contact bones"),
         ("on", "On", "Always push colliding parts apart"),
         ("off", "Off", "Leave limbs as generated")],
-        description="Cleanup pushes limbs out of each other. With many legs this rearranges the gait and crosses the legs, so Auto leaves rigs with five or more contact bones (spiders, crabs, insects) as generated"),
+        description="Cleanup pushes limbs out of each other. With many legs this rearranges the gait and crosses the legs, so Auto leaves rigs with five or more contact bones (spiders, crabs, insects) as generated")
     plant_feet: EnumProperty(name="Plant feet", default="auto", items=[
         ("auto", "Auto", "Hold planted feet in place; off for rigs with five or more contact bones"),
         ("on", "On", "Always hold planted feet"),
         ("off", "Off", "Only lift the body onto the ground")],
-        description="Cleanup holds planted feet still to stop sliding. With many legs this bends the legs across each other, so Auto leaves rigs with five or more contact bones as generated; the body is still lifted onto the ground"),
+        description="Cleanup holds planted feet still to stop sliding. With many legs this bends the legs across each other, so Auto leaves rigs with five or more contact bones as generated; the body is still lifted onto the ground")
     settle_to_ground: BoolProperty(name="Settle on ground", default=True,
         description="Lower the motion until its lowest contact bone touches the ground, if it never does. The model sometimes leaves a walking robot or animal hovering; turn off for creatures meant to fly or hover")
     overlap: IntProperty(name="Transition context", default=10, min=1, max=30)
