@@ -110,9 +110,14 @@ def floor_contact(positions,rotations,skeleton,feet,surface):
     to clear tucked-under feet, tilt flat-lying feet and straighten kneeling
     legs, so it is faded out. Instead the body rests on its lowest non-foot
     capsule (support level: that capsule's height above the ground).
+
+    Only rigs with one or two contact bones are handled. A crab, spider,
+    dragon or dog often has its body close to the ground while its legs still
+    carry it, and a generated root that is too low leaves every foot below the
+    ground; there the feet must stay in charge and lift the body.
     """
     count=len(positions)
-    if not feet or not skeleton.get("collision_capsules"):
+    if not feet or len(feet)>2 or not skeleton.get("collision_capsules"):
         return np.zeros(count),np.zeros(count)
     parents=skeleton["parents"]
     excluded={foot["profile"]["joint"] for foot in feet}

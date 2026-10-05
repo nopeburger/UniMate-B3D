@@ -87,7 +87,34 @@ def flexion(p):
 def unit_rows(v):
     return v/np.linalg.norm(v,axis=1,keepdims=True)
 assert (flexion(knelt_p)>=flexion(kneel_p)-1e-6).all(), "Knee straightened or bent backwards"
-result=dict(passed=["kneeling knee stays down, tucked foot raised","swivelling knee held smoothly","grounded support reduces slide","root path preserved","bone lengths preserved",
+# A low-slung many-legged body (crab, spider): the belly touches the ground and
+# every foot is far below it. The feet stay in charge, so the body is lifted
+# until they stand on the ground; the kneeling logic must not take over.
+legs=3
+joints=1+4*legs
+parents=[-1]
+heads=[[0,0,1.0]]
+names=["body"]
+capsules=[dict(joint=0,a=[0,-.05,1.0],b=[0,.05,1.0],radius=.1)]
+profiles=[]
+for k in range(legs):
+    x=(k-1)*.3
+    base=len(parents)
+    parents+= [0,base,base+1,base+2]
+    heads+= [[x,0,1.0],[x,0,.6],[x,0,.15],[x,-.2,.1]]
+    names+= [f"thigh{k}",f"shin{k}",f"foot{k}",None]
+    capsules.append(dict(joint=base+2,a=[x,-.03,.13],b=[x,-.17,.1],radius=.05))
+    profiles.append(dict(joint=base+2,parent=base+1,upper=base,leg_length=.85,stance_tilt=28,swing_tilt=50))
+crab=dict(parents=parents,heads=heads,bone_names=names,labels=[n or "end" for n in names],
+          rest_matrices=[np.eye(4).tolist() if n else None for n in names],
+          collision_capsules=capsules,foot_profiles=profiles)
+crab_local=np.tile(np.eye(3),(20,len(parents),1,1))
+crab_p,crab_r=forward_kinematics(np.tile([0,0,.1],(20,1)),crab_local,crab)   # body on the ground, feet 0.9 m below it
+assert crab_p[:,[3,7,11],2].max()<-.5
+landed_p,landed_r,landed_report=plant(crab_p,crab_r,crab,ground)
+assert landed_report["floor_contact_frames"]==0, landed_report["floor_contact_frames"]
+assert landed_p[:,[3,7,11],2].min()>-.02, landed_p[:,[3,7,11],2].min()
+result=dict(passed=["low-slung many-legged body lifted onto its feet","kneeling knee stays down, tucked foot raised","swivelling knee held smoothly","grounded support reduces slide","root path preserved","bone lengths preserved",
                     "inclined mesh height and normal","outside-mesh fallback","phase-aware limits",
                     "planted knee keeps generated bend side"],
             planted_step_before=report["median_planted_step_before"],
