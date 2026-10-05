@@ -211,7 +211,8 @@ def generate(request, output, status):
         write_status(status, "running", "Checking self-collisions, ground contact and joint limits")
         source_positions, source_rotations = positions, rotations
         positions, rotations, collision_report = cleanup(
-            positions, rotations, request["skeleton"], request.get("ground"), request.get("settle_to_ground", True))
+            positions, rotations, request["skeleton"], request.get("ground"), request.get("settle_to_ground", True),
+            request.get("self_collision", "auto"), request.get("plant_feet", "auto"))
         # Captured references stay exact: cleanup may not move them.
         if request.get("clips"):
             from timeline import restore_references

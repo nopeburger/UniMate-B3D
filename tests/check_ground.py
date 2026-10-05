@@ -123,7 +123,39 @@ settled_p,_,settled_report=plant(hover_p,hover_r,crab,ground)
 assert abs(settled_report["settled_to_ground"]-(lowest(hover_p)-lowest(settled_p)))<1e-9 and lowest(settled_p)<lowest(hover_p)-.05
 hover_after,_,kept_report=plant(hover_p,hover_r,crab,ground,settle=False)
 assert kept_report["settled_to_ground"]==0 and abs(lowest(hover_after)-lowest(hover_p))<.02
-result=dict(passed=["hovering body settled onto the ground","low-slung many-legged body lifted onto its feet","kneeling knee stays down, tucked foot raised","swivelling knee held smoothly","grounded support reduces slide","root path preserved","bone lengths preserved",
+# Many-legged rigs (five or more contact bones) keep the legs as generated: no
+# self-collision push and no planted-foot holding, but the body is still lifted
+# onto the ground. Three legs keep the full cleanup; the options override Auto.
+from collision import cleanup, stage_enabled
+def legged(count):
+    parents,heads,names,capsules,profiles=[-1],[[0,0,1.0]],["body"],[dict(joint=0,a=[0,-.05,1.0],b=[0,.05,1.0],radius=.1)],[]
+    for k in range(count):
+        x=(k-(count-1)/2)*.2
+        base=len(parents)
+        parents+=[0,base,base+1,base+2]
+        heads+=[[x,0,1.0],[x,0,.6],[x,0,.15],[x,-.2,.1]]
+        names+=["thigh%d"%k,"shin%d"%k,"foot%d"%k,None]
+        capsules.append(dict(joint=base+2,a=[x,-.03,.13],b=[x,-.17,.1],radius=.05))
+        profiles.append(dict(joint=base+2,parent=base+1,upper=base,leg_length=.85,stance_tilt=28,swing_tilt=50))
+    return dict(parents=parents,heads=heads,bone_names=names,labels=[n or "end" for n in names],
+                rest_matrices=[np.eye(4).tolist() if n else None for n in names],collision_capsules=capsules,foot_profiles=profiles)
+three,six=legged(3),legged(6)
+assert stage_enabled("auto",three) and not stage_enabled("auto",six)
+assert stage_enabled("on",six) and not stage_enabled("off",three)
+feet_index=lambda rig:[p["joint"] for p in rig["foot_profiles"]]
+sunk_p,sunk_r=forward_kinematics(np.tile([0,0,.1],(20,1)),np.tile(np.eye(3),(20,len(six["parents"]),1,1)),six)
+kept_p,kept_r,kept_report=cleanup(sunk_p,sunk_r,six,ground)
+assert kept_report["self_collision"] is False and kept_report["planted_feet"] is False
+assert kept_report["ground_contact"]["active_frames"]==0
+assert kept_p[:,feet_index(six),2].min()>-.02, kept_p[:,feet_index(six),2].min()   # body lifted onto the ground
+local_kept=to_local(kept_r,six["parents"]); local_in=to_local(sunk_r,six["parents"])
+assert np.allclose(local_kept[:,[i for i in range(1,len(six["parents"]))]],local_in[:,1:],atol=1e-6)   # legs as generated
+_,_,forced=cleanup(sunk_p,sunk_r,six,ground,plant_feet="on",self_collision="on")
+assert forced["self_collision"] is True and forced["planted_feet"] is True
+three_p,three_r=forward_kinematics(np.tile([0,0,.1],(20,1)),np.tile(np.eye(3),(20,len(three["parents"]),1,1)),three)
+_,_,default3=cleanup(three_p,three_r,three,ground)
+assert default3["self_collision"] is True and default3["planted_feet"] is True
+result=dict(passed=["many-legged rigs keep their generated legs","hovering body settled onto the ground","low-slung many-legged body lifted onto its feet","kneeling knee stays down, tucked foot raised","swivelling knee held smoothly","grounded support reduces slide","root path preserved","bone lengths preserved",
                     "inclined mesh height and normal","outside-mesh fallback","phase-aware limits",
                     "planted knee keeps generated bend side"],
             planted_step_before=report["median_planted_step_before"],

@@ -201,11 +201,31 @@ def stabilize_feet(positions, rotations, skeleton, max_tilt=30.):
     return pos,rot,changed
 
 
-def cleanup(positions,rotations,skeleton,ground=None,settle=True):
+MANY_LEGS=5  # contact bones from which a rig counts as many-legged (spiders, crabs, insects)
+
+def stage_enabled(mode,skeleton):
+    """Resolve an "auto", "on" or "off" cleanup option. Auto turns a stage off for
+    many-legged rigs: pushing eight thin legs apart, or pinning each foot to its
+    own anchor, rearranges the gait the model generated and crosses the legs."""
+    if mode in ("on","off"):
+        return mode=="on"
+    return len(skeleton.get("foot_profiles",[]))<MANY_LEGS
+
+def cleanup(positions,rotations,skeleton,ground=None,settle=True,self_collision="auto",plant_feet="auto"):
     from ground import plant
-    positions,rotations,initial=solve(positions,rotations,skeleton)
-    positions,rotations,contact=plant(positions,rotations,skeleton,ground,settle)
-    positions,rotations,report=solve(positions,rotations,skeleton)
+    collide=stage_enabled(self_collision,skeleton)
+    planting=stage_enabled(plant_feet,skeleton)
+    if collide:
+        positions,rotations,initial=solve(positions,rotations,skeleton)
+    else:
+        initial=dict(method="skipped")
+    positions,rotations,contact=plant(positions,rotations,skeleton,ground,settle,planting)
+    if collide:
+        positions,rotations,report=solve(positions,rotations,skeleton)
+    else:
+        report=dict(method="skipped",frames_with_remaining_contacts=0)
+    report["self_collision"]=collide
+    report["planted_feet"]=planting
     report["initial_collision_pass"]=dict(
         maximum_overlap_before=initial.get("max_penetration_before",0.),
         maximum_overlap_after=initial.get("max_penetration_after",0.))
