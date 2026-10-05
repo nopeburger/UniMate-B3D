@@ -550,7 +550,7 @@ def evaluate(positions,rotations,feet,surface,windows,anchors):
                 max_anchor_error=float(max(errors)) if errors else 0.,
                 unresolved_contact_frames=unresolved)
 
-def plant(positions,rotations,skeleton,ground):
+def plant(positions,rotations,skeleton,ground,settle=True):
     profiles=profiles_for(skeleton)
     feet=foot_capsules(skeleton,profiles)
     if not feet:
@@ -561,8 +561,19 @@ def plant(positions,rotations,skeleton,ground):
         ground=dict(normal=[0.,0.,1.],height=rest,triangles=[])
     surface=Surface(ground,skeleton)
     pos,rot=positions.copy(),rotations.copy()
-    # Lift deep penetrations gradually so the IK can preserve the supplied root path.
     raw=foot_metrics(pos,rot,feet,surface)
+    # The model sometimes leaves a walking character hovering: its lowest foot
+    # never reaches the ground in the whole clip. Training clips always touch
+    # the ground, so lower the motion until the lowest contact bone does.
+    # Lifting a sinking body is done below, frame by frame.
+    settled=0.
+    if settle:
+        clearance=float(min(item["height"].min() for item in raw))
+        if clearance>.02*max(f["profile"]["leg_length"] for f in feet):
+            settled=clearance
+            pos-=settled*surface.normal
+            raw=foot_metrics(pos,rot,feet,surface)
+    # Lift deep penetrations gradually so the IK can preserve the supplied root path.
     floor,level=floor_contact(pos,rot,skeleton,feet,surface)
     intrusion=np.maximum.reduce([np.maximum(-item["height"],0) for item in raw])
     envelope=gaussian_filter1d(maximum_filter1d(intrusion,size=7,mode="nearest"),2,mode="nearest")
@@ -591,7 +602,7 @@ def plant(positions,rotations,skeleton,ground):
                                 for foot,segments in zip(feet,windows)},
                 active_frames=active,maximum_root_lift=float(max(lift)),
                 maximum_root_drop=float(max(0.,-min(lift))),
-                floor_contact_frames=int((floor>=.5).sum()),tucked_feet_raised=raised,
+                floor_contact_frames=int((floor>=.5).sum()),settled_to_ground=settled,tucked_feet_raised=raised,
                 median_planted_step_before=float(np.median(np.concatenate(before_steps))) if before_steps else 0.,
                 missed_surface_queries=surface.misses,foot_limits=limits,
                 bend_corrections=bend_corrections,**metrics)

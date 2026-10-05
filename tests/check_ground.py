@@ -114,7 +114,16 @@ assert crab_p[:,[3,7,11],2].max()<-.5
 landed_p,landed_r,landed_report=plant(crab_p,crab_r,crab,ground)
 assert landed_report["floor_contact_frames"]==0, landed_report["floor_contact_frames"]
 assert landed_p[:,[3,7,11],2].min()>-.02, landed_p[:,[3,7,11],2].min()
-result=dict(passed=["low-slung many-legged body lifted onto its feet","kneeling knee stays down, tucked foot raised","swivelling knee held smoothly","grounded support reduces slide","root path preserved","bone lengths preserved",
+# A character hovering above the ground for the whole clip is lowered until its
+# lowest foot touches it; with settling off it is left where it is.
+hover_p,hover_r=forward_kinematics(np.tile([0,0,1.12],(20,1)),np.tile(np.eye(3),(20,len(parents),1,1)),crab)
+lowest=lambda p:float(p[:,[3,7,11],2].min())
+assert lowest(hover_p)>.1
+settled_p,_,settled_report=plant(hover_p,hover_r,crab,ground)
+assert abs(settled_report["settled_to_ground"]-(lowest(hover_p)-lowest(settled_p)))<1e-9 and lowest(settled_p)<lowest(hover_p)-.05
+hover_after,_,kept_report=plant(hover_p,hover_r,crab,ground,settle=False)
+assert kept_report["settled_to_ground"]==0 and abs(lowest(hover_after)-lowest(hover_p))<.02
+result=dict(passed=["hovering body settled onto the ground","low-slung many-legged body lifted onto its feet","kneeling knee stays down, tucked foot raised","swivelling knee held smoothly","grounded support reduces slide","root path preserved","bone lengths preserved",
                     "inclined mesh height and normal","outside-mesh fallback","phase-aware limits",
                     "planted knee keeps generated bend side"],
             planted_step_before=report["median_planted_step_before"],
