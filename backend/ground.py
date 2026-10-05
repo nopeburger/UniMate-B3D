@@ -101,6 +101,126 @@ def foot_metrics(positions,rotations,feet,surface):
         all_metrics.append(dict(soles=soles,height=height,normals=normals))
     return all_metrics
 
+def floor_contact(positions,rotations,skeleton,feet,surface):
+    """Per-frame floor-contact weight (0..1) and support level.
+
+    A frame is in floor contact when something other than a foot (knee, shin,
+    hand, seat, back) touches the ground: kneeling, crawling, sitting, lying.
+    Foot cleanup assumes the feet carry the body; there it would lift the body
+    to clear tucked-under feet, tilt flat-lying feet and straighten kneeling
+    legs, so it is faded out. Instead the body rests on its lowest non-foot
+    capsule (support level: that capsule's height above the ground).
+    """
+    count=len(positions)
+    if not feet or not skeleton.get("collision_capsules"):
+        return np.zeros(count),np.zeros(count)
+    parents=skeleton["parents"]
+    excluded={foot["profile"]["joint"] for foot in feet}
+    grew=True
+    while grew:
+        grew=False
+        for j,parent in enumerate(parents):
+            if parent in excluded and j not in excluded:
+                excluded.add(j)
+                grew=True
+    heads=np.asarray(skeleton["heads"])
+    capsules=[c for c in skeleton["collision_capsules"] if c["joint"] not in excluded]
+    # A shin's lower end sits beside the ankle and is always near the ground
+    # when standing; only its knee end counts as a floor contact.
+    shins={foot["profile"]["parent"] for foot in feet}
+    if not capsules:
+        return np.zeros(count),np.zeros(count)
+    leg=max(foot["profile"]["leg_length"] for foot in feet)
+    level=np.empty(count)
+    for t in range(count):
+        lowest=np.inf
+        for c in capsules:
+            j=c["joint"]
+            ends=(c["a"],c["b"])
+            if j in shins:
+                ends=(min(ends,key=lambda e:np.linalg.norm(np.asarray(e)-heads[j])),)
+            for end in ends:
+                point=positions[t,j]+rotations[t,j]@(np.asarray(end)-heads[j])
+                height=np.dot(point,surface.normal)-surface.sample(point)[0]-c["radius"]
+                lowest=min(lowest,height)
+        level[t]=lowest
+    near=level<.1*leg
+    # Hold through brief lifts (a crawling knee between steps) and fade slowly,
+    # so the foot corrections do not switch on and off within a few frames.
+    weight=np.clip(gaussian_filter1d(maximum_filter1d(near.astype(float),size=15,mode="nearest"),3,mode="nearest"),0,1)
+    return weight,level
+
+def raise_tucked_feet(positions,rotations,skeleton,feet,surface,weight):
+    """On floor-contact frames, pivot each shin about its knee until the foot
+    (and toes) clear the ground, keeping the knee where it is. The pivot only
+    bends the knee further about its own hinge, never past straight. Pivots
+    are solved per frame, then smoothed over time so the shin cannot jitter."""
+    parents=skeleton["parents"]
+    pos,rot=positions.copy(),rotations.copy()
+    raised=0
+    for foot in feet:
+        j=foot["profile"]["joint"]
+        shin=foot["profile"]["parent"]
+        thigh=foot["profile"]["upper"]
+        chain={j}
+        for k,parent in enumerate(parents):
+            if parent in chain:
+                chain.add(k)
+        pivots=np.zeros((len(pos),3))
+        for t in np.nonzero(weight>0)[0]:
+            knee=pos[t,shin]
+            depth,lowest=min((np.dot(pos[t,k],surface.normal)-surface.sample(pos[t,k])[0],k) for k in chain)
+            if depth>=0:
+                continue
+            arm=pos[t,lowest]-knee
+            upper=knee-pos[t,thigh]
+            lower=pos[t,j]-knee
+            axis=np.cross(upper,lower)  # knee hinge: turning about it bends the knee further
+            if np.linalg.norm(axis)<np.sin(np.radians(10))*np.linalg.norm(upper)*np.linalg.norm(lower):
+                continue  # too straight to know the hinge; leave the leg as generated
+            axis=unit(axis)
+            bent=np.arccos(np.clip(np.dot(unit(upper),unit(lower)),-1,1))
+            limit=max(0.,np.radians(155)-bent)
+            top=knee+Rotation.from_rotvec(axis*limit).apply(arm)
+            if np.dot(top,surface.normal)-surface.sample(top)[0]<=depth:
+                continue  # bending further would not lift the foot
+            # Smallest rotation about the knee that brings the lowest point to the ground.
+            low,high=0.,limit
+            for _ in range(20):
+                angle=(low+high)/2
+                point=knee+Rotation.from_rotvec(axis*angle).apply(arm)
+                if np.dot(point,surface.normal)-surface.sample(point)[0]<0:
+                    low=angle
+                else:
+                    high=angle
+            pivots[t]=axis*high
+        if not pivots.any():
+            continue
+        # Like the body lift: a smoothed running maximum of the angle never
+        # under-shoots a frame and stays continuous; the axis is smoothed too.
+        angle=np.linalg.norm(pivots,axis=1)
+        envelope=np.maximum(angle,gaussian_filter1d(maximum_filter1d(angle,size=7,mode="nearest"),2,mode="nearest"))
+        direction=gaussian_filter1d(pivots,3,axis=0,mode="nearest")
+        direction/=np.maximum(np.linalg.norm(direction,axis=1),1e-9)[:,None]
+        smooth=direction*(envelope*weight)[:,None]
+        local=to_local(rot,parents)
+        frames=np.nonzero(np.linalg.norm(smooth,axis=1)>1e-6)[0]
+        for t in frames:
+            local[t,shin]=rot[t,parents[shin]].T@(Rotation.from_rotvec(smooth[t]).as_matrix()@rot[t,shin])
+        pos,rot=forward_kinematics(pos[:,0],local,skeleton)
+        raised+=len(frames)
+    return pos,rot,raised
+
+def split_windows(windows,keep):
+    """Remove frames where keep is False from stance windows."""
+    result=[]
+    for segments in windows:
+        parts=[]
+        for start,end in segments:
+            parts+=[(start+a,start+b) for a,b in runs(keep[start:end])]
+        result.append(parts)
+    return result
+
 def runs(mask,min_length=4):
     result=[]
     start=None
@@ -134,7 +254,7 @@ def soft_tilt(angle,limit):
     return np.sign(angle)*(np.minimum(abs(angle),shoulder)+
            (limit-shoulder)*np.tanh(extra/np.maximum(limit-shoulder,1e-8)))
 
-def stabilize_feet(positions,rotations,skeleton,feet,surface,windows):
+def stabilize_feet(positions,rotations,skeleton,feet,surface,windows,release=None):
     local=to_local(rotations,skeleton["parents"])
     pos,rot=positions.copy(),rotations.copy()
     changed=[]
@@ -183,6 +303,9 @@ def stabilize_feet(positions,rotations,skeleton,feet,surface,windows):
             step_angle=np.linalg.norm(step)
             if step_angle>cap:
                 desired[t]=desired[t-1]@Rotation.from_rotvec(step*cap/step_angle).as_matrix()
+        if release is not None:  # fade the correction out on floor-contact frames
+            keep=Rotation.from_matrix(desired@original.swapaxes(-1,-2)).as_rotvec()*(1-release)[:,None]
+            desired=Rotation.from_rotvec(keep).as_matrix()@original
         local[:,j]=rot[:,parent].swapaxes(-1,-2)@desired
         pos,rot=forward_kinematics(pos[:,0],local,skeleton)
         changed.append(dict(bone=skeleton["bone_names"][j],
@@ -435,12 +558,22 @@ def plant(positions,rotations,skeleton,ground):
     pos,rot=positions.copy(),rotations.copy()
     # Lift deep penetrations gradually so the IK can preserve the supplied root path.
     raw=foot_metrics(pos,rot,feet,surface)
+    floor,level=floor_contact(pos,rot,skeleton,feet,surface)
     intrusion=np.maximum.reduce([np.maximum(-item["height"],0) for item in raw])
     envelope=gaussian_filter1d(maximum_filter1d(intrusion,size=7,mode="nearest"),2,mode="nearest")
-    lift=np.maximum(intrusion,envelope)
+    # On floor-contact frames the body rests on its lowest non-foot capsule
+    # (raised out of the ground or lowered from floating) instead of on its feet.
+    # Lowering a floating body never pushes the feet into the ground: while
+    # the feet still carry weight (getting down to sit or kneel) the drop is
+    # limited to their clearance. Raising an intruding knee or seat is not limited.
+    clearance=np.maximum(np.minimum.reduce([item["height"] for item in raw]),0)
+    settle=gaussian_filter1d(level,2,mode="nearest")
+    settle=np.where(settle>0,np.minimum(settle,clearance),settle)
+    lift=(1-floor)*np.maximum(intrusion,envelope)-floor*settle
     pos+=lift[:,None,None]*surface.normal
-    windows=stance_windows(pos,rot,feet,surface)
-    pos,rot,limits=stabilize_feet(pos,rot,skeleton,feet,surface,windows)
+    windows=split_windows(stance_windows(pos,rot,feet,surface),floor<.5)
+    pos,rot,limits=stabilize_feet(pos,rot,skeleton,feet,surface,windows,release=floor)
+    pos,rot,raised=raise_tucked_feet(pos,rot,skeleton,feet,surface,floor)
     before=foot_metrics(pos,rot,feet,surface)
     before_steps=[np.linalg.norm(np.diff(item["soles"][s:e],axis=0),axis=1)
                   for item,segments in zip(before,windows) for s,e in segments if e-s>1]
@@ -452,6 +585,8 @@ def plant(positions,rotations,skeleton,ground):
                 stance_windows={skeleton["bone_names"][foot["profile"]["joint"]]:segments
                                 for foot,segments in zip(feet,windows)},
                 active_frames=active,maximum_root_lift=float(max(lift)),
+                maximum_root_drop=float(max(0.,-min(lift))),
+                floor_contact_frames=int((floor>=.5).sum()),tucked_feet_raised=raised,
                 median_planted_step_before=float(np.median(np.concatenate(before_steps))) if before_steps else 0.,
                 missed_surface_queries=surface.misses,foot_limits=limits,
                 bend_corrections=bend_corrections,**metrics)

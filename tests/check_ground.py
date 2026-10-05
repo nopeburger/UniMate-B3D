@@ -69,7 +69,25 @@ held_p,_,_=preserve_bend(swung_p,swung_r,source_many,bend_rig,[dict(profile=bend
 knee_jerk=np.linalg.norm(np.diff(held_p[:,2],2,axis=0),axis=1).max()
 assert knee_jerk<.01, knee_jerk
 assert held_p[:,2,1].max()<0, "Knee left the generated side"
-result=dict(passed=["swivelling knee held smoothly","grounded support reduces slide","root path preserved","bone lengths preserved",
+# Kneeling: the knee rests on the floor and the foot behind it is tucked into
+# the ground. Cleanup keeps the knee down (no body lift), brings the foot out
+# by bending the knee further, and never bends it backwards.
+kneel_rig=dict(skeleton)
+kneel_rig["collision_capsules"]=skeleton["collision_capsules"]+[dict(joint=2,a=[.1,0,.55],b=[.1,0,.2],radius=.05)]
+kneel_local=np.tile(np.eye(3),(20,5,1,1))
+kneel_local[:,2]=Rotation.from_rotvec([np.pi/2,0,0]).as_matrix()   # shin swung back to the floor
+kneel_p,kneel_r=forward_kinematics(np.tile([0,0,.45],(20,1)),kneel_local,kneel_rig)
+assert kneel_p[:,4,2].min()<-.05, "Fixture foot should start in the ground"
+knelt_p,knelt_r,kneel_report=plant(kneel_p,kneel_r,kneel_rig,ground)
+assert kneel_report["floor_contact_frames"]==20
+assert abs(knelt_p[:,2,2]-kneel_p[:,2,2]).max()<.01, "Knee lifted off the floor"
+assert knelt_p[:,3:,2].min()>-.01, knelt_p[:,3:,2].min()
+def flexion(p):
+    return np.degrees(np.arccos(np.clip(np.einsum("ti,ti->t",unit_rows(p[:,2]-p[:,1]),unit_rows(p[:,3]-p[:,2])),-1,1)))
+def unit_rows(v):
+    return v/np.linalg.norm(v,axis=1,keepdims=True)
+assert (flexion(knelt_p)>=flexion(kneel_p)-1e-6).all(), "Knee straightened or bent backwards"
+result=dict(passed=["kneeling knee stays down, tucked foot raised","swivelling knee held smoothly","grounded support reduces slide","root path preserved","bone lengths preserved",
                     "inclined mesh height and normal","outside-mesh fallback","phase-aware limits",
                     "planted knee keeps generated bend side"],
             planted_step_before=report["median_planted_step_before"],

@@ -89,6 +89,16 @@ p2,r2=retime(sp,sr,[(0,60)],two,synthetic,12,30)
 assert worst_jerk(p2,38,60)<.05, worst_jerk(p2,38,60)
 source_local=to_local(sr,synthetic["parents"])
 assert np.allclose(to_local(r2,synthetic["parents"])[39],source_local[native_index(two[0],two[0]["references"][0],60)],atol=1e-8)
+# References are put back exactly after a later edit (cleanup), fading out
+# around them and never past a neighbouring reference.
+from timeline import restore_references
+edited_local=to_local(r2,synthetic["parents"]).copy()
+edited_local[:,1]=Rotation.from_rotvec([0,.3,0]).as_matrix()@edited_local[:,1]
+edited_p,edited_r=forward_kinematics(p2[:,0]+[0,0,.05],edited_local,synthetic)
+back_p,back_r=restore_references(edited_p,edited_r,p2,r2,[39,119],synthetic)
+for f in (39,119):
+    assert np.allclose(back_r[f],r2[f],atol=1e-8) and np.allclose(back_p[f],p2[f],atol=1e-8)
+assert np.allclose(back_r[70],edited_r[70],atol=1e-8), "Restore reached past its falloff"
 # Window planning: one window reproduces the old single-window mapping; long
 # clips chain windows and keep each reference on its proportional frame.
 from timeline import plan_windows
@@ -114,7 +124,7 @@ plan_windows([dict(start=1,end=600,references=[dict(frame=301),dict(frame=305)])
 # retime maps references through the same native index for chained spans.
 chained=[dict(start=1,end=180,references=[dict(frame=90)])]
 assert native_index(chained[0],chained[0]["references"][0],160)==79
-report=dict(passed=["window joins smoothed","reference exits smoothed","window planning","chained reference slots","exact reference frame","earlier prompt preserved","no sit rotation spike",
+report=dict(passed=["references restored after edits","window joins smoothed","reference exits smoothed","window planning","chained reference slots","exact reference frame","earlier prompt preserved","no sit rotation spike",
                     "no endpoint root snap","FK bone lengths","disable editing",
                     "multiple and first-frame references","interior reference release",
                     "short and stretched clips"],
