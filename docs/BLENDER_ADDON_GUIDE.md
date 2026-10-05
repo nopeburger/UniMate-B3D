@@ -38,6 +38,12 @@ The screenshot above shows the single-prompt controls.
 
 Use a timeline when the character should perform multiple described actions. The list shows each clip's inclusive frame range and prompt. Select a row to edit that clip.
 
+### Import a Posecode timeline
+
+Choose **Import Posecode Manifest** to load a `posecode.unimate.constraints.v1` JSON file exported by Posecode. The importer maps the manifest's semantic bones to a Mixamo-style human rig, runs forward kinematics on the selected rig, and stores every authored endpoint as a captured UniMate pose reference. Prompts and inclusive frame ranges are copied into the timeline, so generation can fill the gaps while preserving those references. If the timeline already contains clips, Blender asks before replacing them.
+
+The selected character must be **Human**, use recognizable Mixamo bone names, and have the same FPS as the manifest. Turn off **Animate finger bones** for full Mixamo hands; with terminal bones enabled, a 65-bone Mixamo rig otherwise exports 78 model joints and exceeds the checkpoint's 71-joint limit. Posecode root positions are in world metres, and the exporter accounts for the armature object's uniform scale and rotation. The v1 manifest contains pre-IK authored poses; phase-range contact intent such as `ground-lock` remains evaluation metadata and is not a continuous constraint in UniMate-B3D yet. Review the imported poses and generated contact before production use.
+
 | Control | What it does |
 | --- | --- |
 | **+ / − beside the clip list** | Add or remove a prompt clip. A new clip starts immediately after the previous clip and initially spans 60 frames. Removing a clip does not automatically renumber the others; fix the remaining ranges before generation. |
