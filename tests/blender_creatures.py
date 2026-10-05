@@ -102,7 +102,15 @@ for name, rig in objects.items():
 assert len(contacts(objects["quad_robot"])) == 4
 message = check(objects["robot_arm"], family="objaverse")
 assert "0 contact bones" in message and "ground contact cleanup is skipped" in message, message
+# Rigs with no contact bones in the "Other articulated model" family get a Fixed base hint, once it is on the hint goes.
+assert "turn on Fixed base" in message, message
+settings.fixed_base = True
+assert "Fixed base" not in check(objects["robot_arm"], family="objaverse")
+settings.fixed_base = False
+assert "Fixed base" not in check(rigs["snake"]) and "Fixed base" not in check(objects["quad_robot"], family="objaverse")
 assert "4 contact bones" in check(objects["quad_robot"], family="objaverse")
+lines = unimate_motion.status_lines("Rig ready: 17 bones, 22/71 joints, general model, 2 contact bones")
+assert all(len(l) <= 40 for l in lines) and " ".join(lines).endswith("general model, 2 contact bones"), lines
 assert "not a biped" not in check(objects["quad_robot"], family="objaverse")
 
 # Check Rig says how many contact bones it found and warns when cleanup would be skipped.
@@ -137,7 +145,7 @@ for name, rig in list(rigs.items()) + list(objects.items()) + [("human", human),
             assert np.allclose(head, positions[1, j], atol=1e-4), (name, bone)
 
 report = dict(passed=["joint counts", "thin-side capsules for wings", "contact bones by name", "contact detection",
-                      "steep tip tilt limits", "mark, unmark and clear", "Check Rig contact messages",
+                      "steep tip tilt limits", "mark, unmark and clear", "Check Rig contact messages", "Check Rig fixed base hint", "status wraps at words",
                       "robots and plants", "rest pose round trip"], joints=counts)
 (out / "creatures-blender.json").write_text(json.dumps(report, indent=2))
 print("CREATURES_BLENDER_PASSED", json.dumps(report))

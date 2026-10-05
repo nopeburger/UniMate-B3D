@@ -9,6 +9,7 @@ import numpy as np
 from pathlib import Path
 import subprocess
 import tempfile
+import textwrap
 import time
 import uuid
 import bpy
@@ -326,6 +327,10 @@ def facing_from_feet(skeleton):
     axis = int(np.argmax(np.abs(horizontal)))
     return ("-" if horizontal[axis] < 0 else "") + "XY"[axis]
 
+def status_lines(text, width=40):
+    """Wrap the status text at word boundaries so lines fit the sidebar."""
+    return textwrap.wrap(text, width, break_long_words=True) or [""]
+
 class UNIMATE_OT_validate(bpy.types.Operator):
     bl_idname = "unimate.validate"
     bl_label = "Check Rig"
@@ -349,6 +354,8 @@ class UNIMATE_OT_validate(bpy.types.Operator):
                 warnings.append("No contact bones, so ground contact cleanup is skipped. If this rig has legs, use Detect in the contact bone settings")
             elif settings.family == "mixamo" and len(contacts) > 2:
                 warnings.append(f"{len(contacts)} contact bones is not a biped; consider Character: Animal / Creature")
+            if settings.family == "objaverse" and not contacts and not settings.fixed_base:
+                warnings.append("If this rig should stay in place (a plant, robot arm or machine), turn on Fixed base")
             facing = facing_from_feet(data)
             if facing and facing != settings.forward:
                 warnings.append(f"Feet point {facing.replace('Y', '+Y').replace('X', '+X').replace('-+', '-')}; check Rig faces")
@@ -528,8 +535,8 @@ class UNIMATE_PT_main(bpy.types.Panel):
             layout.operator("unimate.generate", icon="PLAY")
         layout.operator("unimate.apply", icon="ACTION")
         box = layout.box()
-        for offset in range(0, len(settings.status), 44):
-            box.label(text=settings.status[offset:offset+44])
+        for line in status_lines(settings.status):
+            box.label(text=line)
         layout.prop(settings, "advanced", icon="TRIA_DOWN" if settings.advanced else "TRIA_RIGHT", emboss=False)
         if settings.advanced:
             layout.prop(settings, "ground_object")
