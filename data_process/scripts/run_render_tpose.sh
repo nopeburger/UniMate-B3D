@@ -5,10 +5,11 @@
 # Usage:
 #   bash data_process/scripts/run_render_tpose.sh truebones
 #   bash data_process/scripts/run_render_tpose.sh objaverse --multi-worker 8
+#   bash data_process/scripts/run_render_tpose.sh general
 #   DATA_DIR=outputs/mixamo_characters bash data_process/scripts/run_render_tpose.sh mixamo
 #
-# Grids are written flat as <tpose_dir>/<name>.png (one per GLB stem, or
-# per Truebones object type). Runs with plain python + the pip `bpy`
+# Grids are written flat as <tpose_dir>/<name>.png (one per asset file, named
+# like its exported object type, or per Truebones object type). Runs with plain python + the pip `bpy`
 # module: EEVEE needs the module's GPU context.
 #
 # Env overrides: DATA_DIR, OUTPUT_DIR, RESOLUTION, SAMPLES, CAMERA_DIST
@@ -37,6 +38,7 @@ case "$DATASET" in
                EXTRA_ARGS+=(--species_grids) ;;     # one grid per species
     mixamo)    DATA_DIR=${DATA_DIR:-dataset/raw/mixamo/character_refined} ;;
     objaverse) DATA_DIR=${DATA_DIR:-dataset/raw/objaverse/glb} ;;
+    general)   DATA_DIR=${DATA_DIR:-$GENERAL_RAW_DIR} ;;
 esac
 OUTPUT_DIR=${OUTPUT_DIR:-$(tpose_dir "$DATASET")}
 

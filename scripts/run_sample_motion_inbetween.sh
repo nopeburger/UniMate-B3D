@@ -8,9 +8,11 @@
 #
 # Arguments:
 #   exp_dir          training output directory (config.json, dataset_stats.npy, checkpoints/)
-#   test_cases_json  {"<object_type>-<clip_id>": "prompt"} — keys must name dataset
-#                    clips (their motion is the clamped ground truth); omit to use
+#   test_cases_json  {"<asset>-<clip_id>": "prompt"} — keys must name clips (their
+#                    motion is the clamped ground truth): dataset clips, or those of
+#                    a rig_preprocess output made with --save_clips (ASSETS); omit to use
 #                    every clip of the eval split with its original caption
+#                    (with no eval split, every training clip, one per caption)
 #   cfg_scale        classifier-free guidance scale (default: value saved in the run's config)
 #
 # Env overrides:
@@ -20,6 +22,8 @@
 #                         (default: random window)
 #   REPLICATE             samples per clip (default: 3); each draws a new window and noise
 #   SEED                  integer seed for deterministic cropping and noise (default: unset)
+#   ASSETS, COND_PATH, COND_DATASET_TYPE  assets the test cases may name, as in
+#                         run_sample_motion_text.sh
 #   OUTPUT_DIR            (default: <exp_dir>/samples[_<stem>]_inbetween_<keep tag>)
 #   CONDA_ENV             conda environment to activate (default: unimate)
 #   CUDA_VISIBLE_DEVICES  GPU to use (default: the one with the most free memory)
@@ -58,5 +62,6 @@ CMD=(python -m unimate.inference.sample
 [[ -n "$CFG_SCALE" ]]      && CMD+=(--cfg_scale "$CFG_SCALE")
 [[ -n "$GT_START_FRAME" ]] && CMD+=(--gt_start_frame "$GT_START_FRAME")
 [[ -n "$SEED" ]]           && CMD+=(--seed "$SEED")
+add_asset_args
 
 "${CMD[@]}"

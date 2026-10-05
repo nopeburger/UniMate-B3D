@@ -54,6 +54,18 @@ class ObjaverseConfig:
     filter_object: bool = False  # If True, exclude object types listed in {path}/filtered_objects.txt
 
 
+@dataclass
+class GeneralConfig:
+    """Optional dataset slot ``general`` for your own data, in the objaverse
+    layout; used when ``dataset.dataset_list`` names it. Same fields and filters as
+    :class:`ObjaverseConfig`.
+    """
+    type: str = "general"
+    path: str = "dataset/features/general"
+    objects_num: int = -1  # Number of object types to use (-1 = all)
+    filter_object: bool = False  # If True, exclude object types listed in {path}/filtered_objects.txt
+
+
 # ---------------------------------------------------------------------------
 # Dataset config (shared settings + mixture routing)
 # ---------------------------------------------------------------------------
@@ -65,6 +77,7 @@ class DatasetConfig:
     All datasets are loaded via the unified Mixture pipeline.
     Use ``dataset_list`` to specify which sub-datasets to include
     (e.g. ``["truebones"]`` for single-dataset, ``["truebones", "mixamo"]`` for combined).
+    ``"general"`` adds your own data (:class:`GeneralConfig`); it is optional.
     """
     dataset_list: List[str] = field(default_factory=lambda: ["truebones"])
 
@@ -72,6 +85,7 @@ class DatasetConfig:
     truebones: Optional[TruebonesConfig] = None
     mixamo: Optional[MixamoConfig] = None
     objaverse: Optional[ObjaverseConfig] = None
+    general: Optional[GeneralConfig] = None
 
     # Topology conditioning
     topology_condition_type: str = "tpos"  # 'tpos' or 'first_frame'
@@ -88,18 +102,21 @@ class DatasetConfig:
     # Normalization
     use_dataset_stats: bool = True  # True: stats keyed per dataset_type; False: one global pool across all motions
     balanced_stats: bool = False  # True: equal-weight per object type; False: frame-weighted pooling
-    tie_std: bool = False  # True: average std within position(0:3) and rotation(3:9) groups
+    tie_std: bool = False  # True: average std within position(0:3), rotation(3:9) and velocity(9:12)
 
     # Sampling
     sampler_alpha: float = 0.5  # Power-law exponent: 0=uniform-per-sample, 0.5=sqrt-balanced, 1=uniform-per-type
     # Two-level sampling: dataset d gets total probability ∝ N_d^(1-sampler_dataset_alpha)
     # (N_d = its clips; 0 = its natural clip share, 1 = equal per dataset), then sampler_alpha
     # balances object types inside it. None = legacy single level, object types pooled across
-    # datasets (lets one-rig Mixamo fall to <1% of a UniML3D mixture). Default None keeps
-    # configs and runs written before 2026-09-27 bit-identical; the *_v2 configs set 0.25.
+    # datasets (lets one-rig Mixamo fall to <1% of a UniML3D mixture).
     sampler_dataset_alpha: Optional[float] = None
+    # Explicit first level instead: {dataset_type: weight}, dataset d gets total probability
+    # w_d / sum(w), whatever its clip count; sampler_alpha still balances object types inside
+    # it. Keys must be exactly dataset_list; exclusive with sampler_dataset_alpha.
+    sampler_dataset_weights: Optional[Dict[str, float]] = None
 
-    # Train/eval split (clip-level, stratified per object_type).
+    # Train/eval split: whole object types (truebones, objaverse, general), clips (mixamo).
     # test_split_ratio=0 disables splitting (all clips → train).
     test_split_ratio: float = 0.0
     split_seed: int = 42
@@ -116,8 +133,19 @@ class DatasetConfig:
     # Re-align cropped clips so frame-0 facing is identity (only applies when start_idx > 0)
     realign_feature: bool = True
 
+    # Up to three captions per clip (HumanML3D-style): the normal one (captions.json), a short
+    # generic one (features/<ds>/captions_generic.json, ~6 words) and a longer detail one
+    # (captions_detail.json, 7-19 words, the choreography in order). Each training sample
+    # uses the generic caption with probability generic_caption_prob, the detail caption with
+    # probability detail_caption_prob, else the normal one; the two must sum to <= 1
+    # (1/3 + 1/3 = uniform over the three). 0 = that file is not even read. A clip without
+    # the drawn version uses its normal caption.
+    # Eval / sampling keep the normal caption.
+    generic_caption_prob: float = 0.0
+    detail_caption_prob: float = 0.0
+
     # Runtime field — populated in __post_init__, not serialized
-    data_configs: Optional[Dict[str, Union[TruebonesConfig, MixamoConfig, ObjaverseConfig]]] = field(default_factory=dict)
+    data_configs: Optional[Dict[str, Union[TruebonesConfig, MixamoConfig, ObjaverseConfig, GeneralConfig]]] = field(default_factory=dict)
 
     def __post_init__(self):
         if not self.dataset_list:
@@ -135,10 +163,31 @@ class DatasetConfig:
                 "must be 'tpos' or 'first_frame'"
             )
 
+        for name in ('generic_caption_prob', 'detail_caption_prob'):
+            if not 0.0 <= getattr(self, name) <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1], got {getattr(self, name)}")
+        if self.generic_caption_prob + self.detail_caption_prob > 1.0 + 1e-9:
+            raise ValueError(
+                "generic_caption_prob + detail_caption_prob must be <= 1, got "
+                f"{self.generic_caption_prob} + {self.detail_caption_prob}"
+            )
+
+        if self.sampler_dataset_weights is not None:
+            if self.sampler_dataset_alpha is not None:
+                raise ValueError("Set sampler_dataset_weights or sampler_dataset_alpha, not both")
+            if set(self.sampler_dataset_weights) != set(self.dataset_list):
+                raise ValueError(
+                    f"sampler_dataset_weights keys {sorted(self.sampler_dataset_weights)} must be "
+                    f"exactly dataset_list {sorted(self.dataset_list)}")
+            bad = {k: w for k, w in self.sampler_dataset_weights.items() if not w > 0}
+            if bad:
+                raise ValueError(f"sampler_dataset_weights must be > 0, got {bad}")
+
         _config_map = {
             'truebones': lambda: self.truebones or TruebonesConfig(),
             'mixamo': lambda: self.mixamo or MixamoConfig(),
             'objaverse': lambda: self.objaverse or ObjaverseConfig(),
+            'general': lambda: self.general or GeneralConfig(),
         }
         for ds_type in self.dataset_list:
             factory = _config_map.get(ds_type)
@@ -150,6 +199,14 @@ class DatasetConfig:
 # ---------------------------------------------------------------------------
 # Model config
 # ---------------------------------------------------------------------------
+
+# Version used when a config gives only ``text_encoder_type``.
+TEXT_ENCODER_DEFAULTS = {
+    'bert': 'distilbert/distilbert-base-uncased',
+    'clip': 'ViT-B/32',
+    't5': 'google/flan-t5-base',
+}
+
 
 @dataclass
 class ModelConfig:
@@ -216,22 +273,17 @@ class ModelConfig:
     def __post_init__(self):
         # Fail on the config, not minutes later inside create_model once the
         # dataset has already been loaded.
-        for field, value, choices in (
+        for name, value, choices in (
                 ('attention', self.attention, self.ATTENTION_CHOICES),
                 ('text_cond', self.text_cond, self.TEXT_COND_CHOICES)):
             if value not in choices:
                 raise ValueError(
-                    f"model.{field}={value!r} is not one of {list(choices)}")
+                    f"model.{name}={value!r} is not one of {list(choices)}")
 
-        _defaults = {
-            'bert': 'distilbert/distilbert-base-uncased',
-            'clip': 'ViT-B/32',
-            't5': 'google/flan-t5-base',
-        }
         if self.text_encoder_version is None:
-            if self.text_encoder_type not in _defaults:
+            if self.text_encoder_type not in TEXT_ENCODER_DEFAULTS:
                 raise ValueError(f"Unknown text_encoder_type: {self.text_encoder_type}")
-            self.text_encoder_version = _defaults[self.text_encoder_type]
+            self.text_encoder_version = TEXT_ENCODER_DEFAULTS[self.text_encoder_type]
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +340,11 @@ class TrainingConfig:
     lambda_geo: float = 0.5
     lambda_smooth: float = 0.1
 
+    # Flow-matching time distribution during training (flow only)
+    t_sampling: str = "uniform"  # 'uniform', 'logit_normal'
+    t_logit_mean: float = 0.0  # logit_normal: t = sigmoid(mean + std * z)
+    t_logit_std: float = 1.0
+
     # EMA
     use_ema: bool = True
     ema_decay: float = 0.9999
@@ -335,7 +392,7 @@ class MainConfig:
     """Top-level config loaded from JSON.
 
     JSON top-level keys: experiment, truebones, mixamo, objaverse,
-    dataset, model, scheduler, training, sampling.
+    general (optional), dataset, model, scheduler, training, sampling.
     """
     experiment: ExperimentConfig
     truebones: TruebonesConfig
@@ -346,6 +403,8 @@ class MainConfig:
     scheduler: SchedulerConfig
     training: TrainingConfig
     sampling: SamplingArgs
+    # Last and defaulted, so configs without a "general" key still load.
+    general: GeneralConfig = field(default_factory=GeneralConfig)
 
     @classmethod
     def from_json(cls, config_path: Union[str, Path]) -> 'MainConfig':
@@ -359,12 +418,14 @@ class MainConfig:
         truebones = TruebonesConfig(**data.get('truebones', {}))
         mixamo = MixamoConfig(**data.get('mixamo', {}))
         objaverse = ObjaverseConfig(**data.get('objaverse', {}))
+        general = GeneralConfig(**data.get('general', {}))
 
         # Inject per-dataset configs into dataset block for __post_init__
         dataset_data = data['dataset']
         dataset_data['truebones'] = truebones
         dataset_data['mixamo'] = mixamo
         dataset_data['objaverse'] = objaverse
+        dataset_data['general'] = general
         dataset = DatasetConfig(**dataset_data)
 
         model_data = dict(data['model'])
@@ -406,6 +467,7 @@ class MainConfig:
             truebones=truebones,
             mixamo=mixamo,
             objaverse=objaverse,
+            general=general,
             dataset=dataset,
             model=model,
             scheduler=scheduler,
@@ -419,7 +481,7 @@ class MainConfig:
         # Remove runtime-only fields that are reconstructed in __post_init__
         data['dataset'].pop('data_configs', None)
         # Remove nested sub-configs from dataset (they live at top level)
-        for key in ('truebones', 'mixamo', 'objaverse'):
+        for key in ('truebones', 'mixamo', 'objaverse', 'general'):
             data['dataset'].pop(key, None)
         with open(config_path, 'w') as f:
             json.dump(data, f, indent=4)

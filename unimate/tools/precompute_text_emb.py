@@ -12,6 +12,10 @@ One file per source, each keyed the way the dataset looks it up:
                           keys of captions.json), so a clip's features are a
                           direct lookup; two clips sharing a caption each get
                           their own entry
+  * ``captions_generic.json`` -> ``caption_generic_emb_cache.npz``, the same for
+                          the second, generic caption of each clip
+  * ``captions_detail.json`` -> ``caption_detail_emb_cache.npz``, the same for
+                          the third, detail caption of each clip
   * ``cond.npy``       -> ``joint_emb_cache.npz``  one entry per UNIQUE joint
                           name, taken from the cleaned vocabulary
                           ``clean_joint_names`` (see
@@ -33,7 +37,7 @@ using another.
 
 Usage (from the repo root)::
 
-    # every dataset/features/* with the config's encoder
+    # the config's datasets (their feature paths) with the config's encoder
     python -m unimate.tools.precompute_text_emb --config configs/uniml3d_60frames_graph_adaln.json
 
     # one input folder (positional or --input_dir), encoder given explicitly
@@ -43,9 +47,11 @@ Usage (from the repo root)::
     # re-encode even if a cache is already there
     python -m unimate.tools.precompute_text_emb --config <cfg> --overwrite
 
-Re-run it after regenerating captions or joint names: entries the cache does
-not cover are encoded at load time anyway, so a stale cache costs speed rather
-than correctness, but a fresh one keeps the encoder out of the run entirely.
+Re-run it after regenerating captions or joint names. Caption caches store
+the text of every entry, so an entry whose caption has since changed is
+re-encoded here; until then the data loader treats it as a cache miss and
+encodes it live at startup (correct, but it loads the text encoder). A cache
+without stored texts is rebuilt in full.
 """
 
 import argparse
@@ -58,13 +64,13 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from unimate.configs.schema import MainConfig
+from unimate.configs.schema import TEXT_ENCODER_DEFAULTS, MainConfig
 from unimate.dataset.mixture.dataset import model_joint_names
 from unimate.models.text_encoder.factory import create_text_encoder
 from unimate.utils.logger import get_logger
-from unimate.utils.text_emb_cache import (KINDS, cache_path, load_cache,
-                                          pooled_from_hidden, save_cache,
-                                          sequences_from_hidden)
+from unimate.utils.text_emb_cache import (KINDS, cache_path, cache_texts,
+                                          load_cache, pooled_from_hidden,
+                                          save_cache, sequences_from_hidden)
 
 logger = get_logger(file_name=__file__)
 
@@ -78,16 +84,20 @@ DEFAULT_GLOB = 'dataset/features/*'
 def collect_texts(root_dir):
     """What each source needs encoded -> ``{kind: {key: text}}``.
 
-    ``'caption'`` maps every clip key to its caption; ``'joint'`` maps each
+    ``'caption'`` / ``'caption_generic'`` / ``'caption_detail'`` map every
+    clip key to its normal / generic / detail caption; ``'joint'`` maps each
     unique joint name to itself. A source with no file simply does not appear.
     """
     out = {}
 
-    captions_path = pjoin(root_dir, 'captions.json')
-    if os.path.isfile(captions_path):
-        with open(captions_path) as f:
-            captions = json.load(f)
-        out['caption'] = {clip: cap for clip, cap in captions.items() if cap}
+    for kind, name in (('caption', 'captions.json'),
+                       ('caption_generic', 'captions_generic.json'),
+                       ('caption_detail', 'captions_detail.json')):
+        captions_path = pjoin(root_dir, name)
+        if os.path.isfile(captions_path):
+            with open(captions_path) as f:
+                captions = json.load(f)
+            out[kind] = {clip: cap for clip, cap in captions.items() if cap}
 
     cond_path = pjoin(root_dir, 'cond.npy')
     if os.path.isfile(cond_path):
@@ -159,10 +169,12 @@ def parse_args():
                          'dataset/features/truebones. Same as --input_dir.')
     ap.add_argument('--input_dir', action='append', default=[], metavar='DIR',
                     help='Feature directory to process; repeatable. With '
-                         f'neither form given, every {DEFAULT_GLOB} is done.')
+                         'neither form given: the --config datasets\' feature '
+                         f'paths, else every {DEFAULT_GLOB}.')
     ap.add_argument('--config', default=None,
                     help='Training config to take the encoder type / version '
-                         'from; --encoder_type / --encoder_version override it')
+                         'and the feature directories from; --encoder_type / '
+                         '--encoder_version override it')
     ap.add_argument('--encoder_type', default=None, help="'t5', 'clip', 'bert'")
     ap.add_argument('--encoder_version', default=None,
                     help="e.g. 'google/flan-t5-base' (None = the type's default)")
@@ -178,14 +190,29 @@ def main():
     args = parse_args()
 
     encoder_type, encoder_version = args.encoder_type, args.encoder_version
+    config_roots = []
     if args.config:
         cfg = MainConfig.from_json(args.config)
+        # Without explicit folders: the feature directories the config trains on.
+        paths = [getattr(cfg, ds).path for ds in cfg.dataset.dataset_list]
+        config_roots = [p for p in paths if os.path.isdir(p)]
+        for p in paths:
+            if p not in config_roots:
+                logger.warning(f'{args.config}: feature directory {p} not found; skipped')
+        if not config_roots and not (args.inputs or args.input_dir):
+            raise SystemExit(f'None of the feature directories of {args.config} exist: {paths}')
+        # The config's version belongs to the config's encoder type only.
+        if encoder_type is None or encoder_type == cfg.model.text_encoder_type:
+            encoder_version = encoder_version or cfg.model.text_encoder_version
         encoder_type = encoder_type or cfg.model.text_encoder_type
-        encoder_version = encoder_version or cfg.model.text_encoder_version
     if not encoder_type:
         raise SystemExit('Give --encoder_type or --config')
+    if encoder_version is None:
+        encoder_version = TEXT_ENCODER_DEFAULTS.get(encoder_type)
+        if encoder_version is None:
+            raise SystemExit(f"Unknown --encoder_type {encoder_type!r}")
 
-    roots = resolve_roots(list(args.inputs) + list(args.input_dir))
+    roots = resolve_roots(list(args.inputs) + list(args.input_dir) or config_roots)
     logger.info(f'Encoder: {encoder_type} / {encoder_version} on {args.device}')
 
     # The encoder is built on the first directory that actually needs it, so a
@@ -198,18 +225,30 @@ def main():
             continue
 
         for kind, text_by_key in by_kind.items():
-            hit = ({} if args.overwrite
-                   else load_cache(root, kind, encoder_type, encoder_version))
+            sequence = not KINDS[kind][1]
+            # A caption cache without stored texts cannot be checked for
+            # captions edited since it was built: rebuild it in full.
+            rebuild = args.overwrite or (sequence and cache_texts(root, kind) is None)
+            loaded = ({} if rebuild
+                      else load_cache(root, kind, encoder_type, encoder_version,
+                                      texts=text_by_key if sequence else None))
+            # Entries for clips no longer listed are dropped (the file is
+            # rewritten below whenever there are any).
+            orphans = [k for k in loaded if k not in text_by_key]
+            hit = {k: v for k, v in loaded.items() if k in text_by_key}
             # A sequence kind loads as (tokens, pooled) pairs; split them so
-            # both views survive an incremental re-run.
+            # both views survive an incremental re-run. A pooled kind loads as
+            # (D,) vectors: keep them as the pooled values and give save_cache
+            # a (1, D) sequence so they sit beside newly encoded (T, D) ones.
             if KINDS[kind][1]:
-                cached, cached_pooled = dict(hit), {}
+                cached = {k: v[None] for k, v in hit.items()}
+                cached_pooled = dict(hit)
             else:
                 cached = {k: v[0] for k, v in hit.items()}
                 cached_pooled = {k: v[1] for k, v in hit.items()}
             todo_keys = [k for k in text_by_key if k not in cached]
             path = cache_path(root, kind)
-            if not todo_keys:
+            if not todo_keys and not orphans:
                 logger.info(f'[{root}] {kind}: {len(text_by_key)} keys already '
                             f'cached in {os.path.basename(path)}; nothing to do')
                 continue
@@ -219,21 +258,24 @@ def main():
             unique = sorted({text_by_key[k] for k in todo_keys})
             logger.info(f'[{root}] {kind}: {len(text_by_key)} keys, '
                         f'{len(todo_keys)} to encode over {len(unique)} distinct '
-                        f'strings, {len(cached)} reused')
-            if encoder is None:
+                        f'strings, {len(cached)} reused, {len(orphans)} orphans dropped')
+            if unique and encoder is None:
                 # pool=False: the cache stores token sequences; pooling for the
                 # adaLN path happens in the data loader.
                 encoder = create_text_encoder(encoder_type=encoder_type,
                                               encoder_version=encoder_version,
                                               device=args.device, pool=False)
-            by_text, pooled_by_text = encode_texts(
-                unique, encoder, args.chunk_size,
-                f'{os.path.basename(root.rstrip("/"))}/{kind}')
-            cached.update({k: by_text[text_by_key[k]] for k in todo_keys})
-            cached_pooled.update({k: pooled_by_text[text_by_key[k]]
-                                  for k in todo_keys})
+            if unique:
+                by_text, pooled_by_text = encode_texts(
+                    unique, encoder, args.chunk_size,
+                    f'{os.path.basename(root.rstrip("/"))}/{kind}')
+                cached.update({k: by_text[text_by_key[k]] for k in todo_keys})
+                cached_pooled.update({k: pooled_by_text[text_by_key[k]]
+                                      for k in todo_keys})
             n = save_cache(path, cached, kind, encoder_type, encoder_version,
-                           pooled_by_key=cached_pooled)
+                           pooled_by_key=cached_pooled,
+                           texts_by_key=({k: text_by_key[k] for k in cached}
+                                         if sequence else None))
             what = 'pooled vectors' if KINDS[kind][1] else 'token sequences'
             logger.info(f'[{root}] wrote {n} {what} -> {path}')
 

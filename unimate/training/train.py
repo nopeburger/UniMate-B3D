@@ -5,9 +5,11 @@ Entry point (usually via ``accelerate launch``, see scripts/)::
     python -m unimate.training.train --config configs/<config>.json
 
 CLI overrides (via tyro): ``--output_dir``, ``--batch_size``, ``--num_workers``,
-``--resume``.
+``--resume``, ``--stats_path``.
 """
 
+import json
+import math
 import os
 import warnings
 from dataclasses import dataclass
@@ -44,6 +46,10 @@ class TrainingArgs:
     batch_size: Optional[int] = None
     num_workers: Optional[int] = None
     resume: Optional[str] = None  # path to checkpoint .pt file to resume from
+    # Normalization stats to load instead of computing them from the data
+    # (e.g. the dataset_stats.npy of the run being fine-tuned). Default: the
+    # resumed run's own file with --resume, otherwise computed.
+    stats_path: Optional[str] = None
 
 
 # ===================================================================
@@ -78,14 +84,25 @@ def train_diffusion(args: TrainingArgs, config: MainConfig,
 
     # ---- Dataset ----
     logger.info("Creating dataset loader...")
-    batch_size = args.batch_size or config.training.batch_size
-    num_workers = args.num_workers or config.training.num_workers
+    # `is not None`, not `or`: --num_workers 0 (load in the main process) is
+    # a valid override that `or` would silently replace with the config value.
+    batch_size = (args.batch_size if args.batch_size is not None
+                  else config.training.batch_size)
+    num_workers = (args.num_workers if args.num_workers is not None
+                   else config.training.num_workers)
+    # Write the overrides back so the run's config.json records what ran.
+    config.training.batch_size = batch_size
+    config.training.num_workers = num_workers
+    stats_src = _resolve_train_stats_path(args)
+    _pin_resumed_max_depth(args, config)
     dataloader = create_train_dataloader(
         dataset_config=config.dataset,
         model_config=config.model,
         balanced=config.training.balanced,
         batch_size=batch_size,
         num_workers=num_workers,
+        stats_path=stats_src,
+        seed=config.training.seed or 0,
     )
 
     # ---- Persist config (after dataset so auto-computed max_joints /
@@ -115,19 +132,12 @@ def train_diffusion(args: TrainingArgs, config: MainConfig,
         checkpoint_dir=checkpoint_dir,
     )
 
-    # ---- Optimizer & LR schedule ----
+    # ---- Optimizer (the LR schedule follows the tracker, below) ----
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.training.learning_rate,
         weight_decay=config.training.weight_decay,
         betas=(config.training.adam_beta1, config.training.adam_beta2),
-    )
-    lr_scheduler = get_cosine_with_min_lr_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=int(config.training.warmup_ratio * config.training.num_steps),
-        num_training_steps=config.training.num_steps,
-        min_lr_rate=config.training.min_lr_ratio,
-        num_cycles=0.5,
     )
 
     # ---- Accelerate: wrap model, optimizer, dataloader for distributed ----
@@ -145,10 +155,20 @@ def train_diffusion(args: TrainingArgs, config: MainConfig,
     writer = SummaryWriter(log_dir) if is_main else None
 
     # ---- Training tracker ----
+    # Optimizer steps per epoch: this rank's batches over the accumulation
+    # (accelerate also steps on an epoch's last, partial group).
     tracker = TrainingTracker(
         max_epochs=config.training.num_epochs,
         max_steps=config.training.num_steps,
-        steps_per_epoch=len(dataloader),
+        steps_per_epoch=math.ceil(
+            len(dataloader) / config.training.gradient_accumulation_steps),
+    )
+    lr_scheduler = get_cosine_with_min_lr_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(config.training.warmup_ratio * tracker.total_steps),
+        num_training_steps=tracker.total_steps,
+        min_lr_rate=config.training.min_lr_ratio,
+        num_cycles=0.5,
     )
 
     # ---- Resume from checkpoint (if requested) ----
@@ -157,6 +177,11 @@ def train_diffusion(args: TrainingArgs, config: MainConfig,
             args.resume, accelerator, model, optimizer, lr_scheduler,
             trainer, tracker,
         )
+        # The checkpoint holds no RNG state; reseeding with the resumed step
+        # keeps the flow-matching t, noise and caption-dropout draws from
+        # repeating the stream the run already used from step 0.
+        if config.training.seed is not None:
+            set_seed(config.training.seed + tracker.current_step, device_specific=True)
 
     if is_main:
         logger.info(f"Training for {tracker.get_duration_str()}")
@@ -292,22 +317,26 @@ def train_diffusion(args: TrainingArgs, config: MainConfig,
 # ===================================================================
 
 def _set_sampler_epoch(dataloader, epoch: int):
-    """Call set_epoch on the underlying sampler if it supports it (for DDP).
+    """Set the sampler's epoch so each epoch draws different indices (DDP-safe).
 
-    After accelerator.prepare(), the chain is:
-      dataloader.batch_sampler → BatchSamplerShard
-        .batch_sampler → original BatchSampler
-          .sampler → MixtureSampler (or DistributedSampler)
-    We walk the chain until we find a sampler with set_epoch.
+    An Accelerate-prepared loader (``DataLoaderShard``) re-sets its sampler
+    to its own ``iteration`` counter at the start of every ``__iter__``; that
+    counter starts at 0 in a new process, so it must be set through the
+    loader's ``set_epoch`` or a resumed run replays the epoch order from 0.
+
+    A plain loader: walk the batch_sampler chain (Accelerate's
+    BatchSamplerShard stores the original as ``.batch_sampler``, whose
+    ``.sampler`` is the MixtureSampler or DistributedSampler).
     """
-    # Walk batch_sampler chain (Accelerate's BatchSamplerShard wraps the original)
+    if hasattr(dataloader, 'set_epoch'):
+        dataloader.set_epoch(epoch)
+        return
     bs = getattr(dataloader, 'batch_sampler', None)
     while bs is not None:
         sampler = getattr(bs, 'sampler', None)
         if sampler is not None and hasattr(sampler, 'set_epoch'):
             sampler.set_epoch(epoch)
             return
-        # Accelerate's BatchSamplerShard stores the original as .batch_sampler
         bs = getattr(bs, 'batch_sampler', None)
 
     # Fallback: direct sampler attribute
@@ -337,15 +366,12 @@ def _log_metrics(writer, trainer, lr_scheduler, loss_dict, grad_norm,
 def _save_checkpoint_and_visualize(trainer, accelerator, model, optimizer,
                                    lr_scheduler, tracker, config,
                                    checkpoint_dir, debug_dir):
-    """Generate sample visualizations and persist a checkpoint to disk."""
-    trainer.visualize_samples(
-        save_dir=debug_dir,
-        prefix=f"step_{tracker.current_step}",
-        num_samples=config.sampling.num_samples,
-        cfg_scale=config.sampling.cfg_scale,
-    )
-    torch.cuda.empty_cache()
+    """Persist a checkpoint to disk, then render sample visualizations.
 
+    The checkpoint is written first and a visualization failure is only
+    logged, so a crash in the debug ODE solve or the renderer can neither
+    lose the checkpoint nor end the run.
+    """
     checkpoint_dict = {
         "model_state_dict": accelerator.get_state_dict(model),
         "optimizer_state_dict": optimizer.state_dict(),
@@ -361,6 +387,72 @@ def _save_checkpoint_and_visualize(trainer, accelerator, model, optimizer,
     )
     accelerator.save(checkpoint_dict, checkpoint_path)
     logger.info(f"Saved checkpoint to {checkpoint_path}")
+    del checkpoint_dict
+
+    try:
+        trainer.visualize_samples(
+            save_dir=debug_dir,
+            prefix=f"step_{tracker.current_step}",
+            num_samples=config.sampling.num_samples,
+            cfg_scale=config.sampling.cfg_scale,
+        )
+    except Exception:
+        logger.exception(
+            f"Sample visualization failed at step {tracker.current_step}; "
+            f"the checkpoint is saved and training continues.")
+    torch.cuda.empty_cache()
+
+
+def _resumed_run_dir(resume_path):
+    """``<run>`` for ``<run>/checkpoints/<ckpt>.pt`` (the layout training
+    writes), else the checkpoint's own directory."""
+    ckpt_dir = os.path.dirname(os.path.abspath(resume_path))
+    return (os.path.dirname(ckpt_dir)
+            if os.path.basename(ckpt_dir) == "checkpoints" else ckpt_dir)
+
+
+def _pin_resumed_max_depth(args, config):
+    """With ``--resume`` and an auto ``dataset.max_depth`` (0), cap it at the
+    resumed run's saved value, so the depth embedding keeps the checkpoint's
+    shape even if the auto value computed from the data has grown since.
+    A config that sets ``max_depth`` wins."""
+    if not args.resume or config.dataset.max_depth > 0:
+        return
+    run_config = os.path.join(_resumed_run_dir(args.resume), "config.json")
+    if not os.path.isfile(run_config):
+        logger.warning(f"No config.json at {run_config}; max_depth is recomputed "
+                       f"from the data and must match the checkpoint's")
+        return
+    with open(run_config) as f:
+        saved = json.load(f).get("dataset", {}).get("max_depth", 0)
+    if saved > 0:
+        config.dataset.max_depth = saved
+        logger.info(f"Resuming: dataset.max_depth capped at the run's saved {saved}")
+
+
+def _resolve_train_stats_path(args):
+    """Stats file the run must reuse, or ``None`` to compute from the data.
+
+    ``--stats_path`` wins. With ``--resume``, the checkpoint's run directory
+    supplies the stats the weights were trained with: ``<run>`` for
+    ``<run>/checkpoints/<ckpt>.pt`` (the layout training writes), else the
+    checkpoint's own directory. Recomputing them would shift the
+    normalization whenever the data changed in between.
+    """
+    if args.stats_path:
+        if not os.path.isfile(args.stats_path):
+            raise FileNotFoundError(f"--stats_path {args.stats_path} does not exist")
+        return args.stats_path
+    if args.resume:
+        candidate = os.path.join(_resumed_run_dir(args.resume), "dataset_stats.npy")
+        if os.path.isfile(candidate):
+            return candidate
+        logger.warning(
+            f"No dataset_stats.npy at {candidate}; recomputing stats from the "
+            f"current data, which only matches the checkpoint if the data and "
+            f"the stats settings are unchanged. Pass --stats_path to pin them."
+        )
+    return None
 
 
 def _resume_from_checkpoint(

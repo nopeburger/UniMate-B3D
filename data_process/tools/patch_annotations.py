@@ -22,7 +22,7 @@ place. Two kinds of fixes:
       orientation and where one sided label sits on both sides of the body
       (a duplicated chain) — there only that chain is relabelled;
     - the ``clean`` fields of face_joint_names.json are re-synced;
-    - objaverse rigs are flagged in ``rig_flags.json``: automatically when the
+    - objaverse (and general) rigs are flagged in ``rig_flags.json``: automatically when the
       facing pair cannot be trusted (``source: empty``, a Bone/Bone pair, a body
       axis through unnamed bones), plus the hand-reviewed categories. Only the
       ``FILTER_CATEGORIES`` rigs (``tpose_wrong``, ``not_in_legacy_raw``) are also
@@ -36,11 +36,20 @@ place. Two kinds of fixes:
       facing axis (|cos| > 0.8 averaged over the clip), otherwise the qualifier
       is dropped (thresholds in body heights, see ``--still`` / ``--travel``).
 
-  manual overrides (JSON files in ``--patch_dir``)
+  manual overrides (JSON files in ``--patch_dir``; a step whose file is absent
+  leaves its earlier output, e.g. a downloaded export's, as it is)
     <ds>_joint_labels.json   {rig: {raw_joint_name: clean_label}}
     <ds>_face_pairs.json     {rig: {"r_hip": raw, "l_hip": raw, "source": s,
                                     ["body_axis": true]}}
     <ds>_captions.json       {clip: caption}   (applied before the rules)
+    <ds>_captions_llm.json   {clip: {"old", "new", "ok", "tries"}}   (vlm_caption/caption_rewrite_llm.py
+                             output: an entry with ok true replaces the caption while it still equals
+                             "old"; <ds>_captions.json wins for the same clip)
+    <ds>_captions_generic.json  {clip: caption}   (the second, generic caption of every clip; the
+                             patch is its only source. Same rules as above ->
+                             export/<ds>/motion_captions_generic.json)
+    <ds>_captions_detail.json   {clip: caption}   (the third, detail caption, 7-19 words; the same
+                             way -> export/<ds>/motion_captions_detail.json)
     <ds>_categories.json     {rig: category}   (moves the rig in category_groups.json)
     <ds>_filtered_clips.txt  <clip>   # <reason>   (any dataset: individual clips ->
                              export/<ds>/filtered_clips.txt, skipped by stage 4)
@@ -53,9 +62,19 @@ place. Two kinds of fixes:
                              the animal is tilted; export/<ds>/motions/<clip>.npz is REWRITTEN with
                              anim_local_rot[:, 0] = anim_local_rot[:, 0] * quat on every frame. Idempotent,
                              and undone when the entry is removed; see apply_root_offsets)
-    <ds>_rig_flags.txt       <rig>    # <category>: <reason>   (objaverse: hand-reviewed rig flags ->
-                             export/objaverse/rig_flags.json; only tpose_wrong / not_in_legacy_raw
-                             also go to export/objaverse/filtered_objects.txt, which stage 4 skips)
+    <ds>_rest_orientation.json  {rig: {"quat": [w, x, y, z], "offset": [x, y, z], "reason": s}}   (any
+                             dataset: the rig's rest pose lies, leans or is upside down; every
+                             export/<ds>/motions/<rig>-*.npz is REWRITTEN with its rest pose moved by
+                             p -> quat * p + offset in export space (offset optional); the
+                             processed GLB applies the same rotation. Idempotent, undone when the entry
+                             is removed; see apply_rest_orientations)
+    <ds>_rig_flags.txt       <rig>    # <category>: <reason>   (objaverse / general: hand-reviewed rig
+                             flags -> export/<ds>/rig_flags.json; only tpose_wrong / not_in_legacy_raw
+                             also go to export/<ds>/filtered_objects.txt, which stage 4 skips)
+
+  ``general`` (extra assets of your own in dataset/raw/general/animation, objaverse layout) gets the
+  objaverse treatment: automatic side-from-x on duplicated chains and rig flags. Its patch
+  files, if you write any, are named general_*.
 
 Usage (from the repo root; ``dataset/export/<ds>`` may be symlinks):
     python data_process/tools/patch_annotations.py [--dry_run] [--datasets truebones mixamo]
@@ -82,10 +101,13 @@ import numpy as np
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 from data_process.utils.kinematics import (  # noqa: E402
-    fk, frame_global, qmul, qrot, rest_global,
+    frame_global, qmul, qrot, rest_global,
 )
 
-DATASETS = ('truebones', 'mixamo', 'objaverse')
+DATASETS = ('truebones', 'mixamo', 'objaverse', 'general')
+# Multi-object layouts (one rigged asset per object type, arbitrary rigs): automatic
+# side-from-x on duplicated chains, rig_flags.json and filtered_objects.txt.
+OBJECT_DATASETS = ('objaverse', 'general')
 # One subject for the whole corpus. The three datasets are trained as one
 # mixture, so a per-dataset subject ('An animal' / 'A person') would hand the
 # text encoder a free dataset label and defeat the topology-agnostic
@@ -318,7 +340,7 @@ def patch_joint_labels(ds, root, clean, names, overrides, stats, log):
             log.append(f'[{ds}] {rig}: no NPZ, side-from-x skipped')
             continue
         side_from_x(clean[rig], np.load(f, allow_pickle=True), stats)
-    if ds == 'objaverse':      # auto: duplicated-side chains on rigs that face +Z per their names
+    if ds in OBJECT_DATASETS:  # auto: duplicated-side chains on rigs that face +Z per their names
         for rig in clean:
             if rig in explicit:
                 continue
@@ -386,6 +408,17 @@ def patch_face_pairs(ds, face, clean, names, overrides, stats, log):
                 if entry[key].get('clean') != new:
                     entry[key]['clean'] = new
                     stats['face-clean-resync'] += 1
+        # re-sync source: it names what the pair is, so it follows the labels
+        # ('manual' overrides and relabelled Bone pairs otherwise keep a stale tag)
+        if entry.get('body_axis'):
+            src = 'body_axis'
+        else:
+            parts = {re.sub(r'^(Left|Right)\s+|\s+End$', '', entry[k]['clean']).lower()
+                     for k in ('r_hip', 'l_hip')}
+            src = parts.pop() if len(parts) == 1 else entry.get('source')
+        if src and entry.get('source') != src:
+            entry['source'] = src
+            stats['face-source-resync'] += 1
 
 
 # Rig flag categories. Only FILTER_CATEGORIES end up in filtered_objects.txt (stage 4 skips
@@ -402,7 +435,7 @@ FILTER_CATEGORY_NOTES = {
 }
 
 
-def load_rig_flags(path, names, log):
+def load_rig_flags(ds, path, names, log):
     """``patches/<ds>_rig_flags.txt``: one ``<rig>    # <category>: <reason>`` per line — hand-reviewed
     rigs (``tpose_wrong`` = rest pose lying / rotated, ``not_in_legacy_raw`` = raw GLB absent from the legacy
     raw set and held out, ``facing_wrong`` = the facing pair does not give the real front, ``object_no_front``
@@ -423,13 +456,13 @@ def load_rig_flags(path, names, log):
             if not rig:
                 continue
             if rig not in names:
-                log.append(f'[objaverse] rig flag for unknown rig {rig!r} ignored')
+                log.append(f'[{ds}] rig flag for unknown rig {rig!r} ignored')
                 continue
             cat, _, reason = comment.strip().partition(':')
             cat = cat.strip() or 'flagged'
             if rig in out:
                 prev = out[rig][0]
-                log.append(f'[objaverse] rig {rig!r} is listed twice in {os.path.basename(path)}: '
+                log.append(f'[{ds}] rig {rig!r} is listed twice in {os.path.basename(path)}: '
                            f'{prev!r} then {cat!r}; ' +
                            (f'{cat!r} wins and the {prev!r} entry is dropped'
                             if prev != cat else 'the duplicate line is redundant'))
@@ -441,7 +474,7 @@ def write_filtered_clips(ds, root, patch_dir, frames, dry_run, log):
     """export/<ds>/filtered_clips.txt — hand-reviewed individual clips that stage 4 skips.
 
     Every dataset may have one: stage 4 applies the clip list before it groups
-    clips into object types, so it is not objaverse-only the way
+    clips into object types, so it is not limited to objaverse / general the way
     filtered_objects.txt is. patches/<ds>_filtered_clips.txt holds
     ``<clip stem>    # <reason>`` lines (motion discontinuity, skeletons that
     disagree with the object's reference rig, and anything else reviewed by hand).
@@ -598,7 +631,10 @@ def apply_root_offsets(ds, root, patch_dir, dry_run, log):
     and the next run of this script fixes them again. Returns the clips whose NPZ
     changed (their cached root motion is stale).
     """
-    want = load_overrides(os.path.join(patch_dir, f'{ds}_root_offsets.json'))
+    src = os.path.join(patch_dir, f'{ds}_root_offsets.json')
+    if not os.path.isfile(src):
+        return []           # no patch file: leave earlier fixes in place
+    want = load_overrides(src)
     mdir = os.path.join(root, 'motions')
     changed, n_ok = [], 0
     targets = set(want)
@@ -644,7 +680,100 @@ def apply_root_offsets(ds, root, patch_dir, dry_run, log):
     return changed
 
 
-def write_rig_flags(root, face, frames, manual, dry_run, log):
+REST_ORIENTATION_KEY = 'rest_orientation_applied'   # the quat currently baked into the rest pose
+
+
+def apply_rest_orientations(ds, root, patch_dir, dry_run, log):
+    """Stand a rig's rest pose up, in place, in every export NPZ of the rig.
+
+    A rest pose can lie flat, lean or stand upside down while the clips play
+    upright: the bind pose was authored in another orientation. Since the rest is
+    one rigid pose, a single rotation fixes it. patches/<ds>_rest_orientation.json
+    maps ``rig -> {"quat": [w, x, y, z], "offset": [x, y, z], "reason": ...}``, a
+    rotation and an optional translation in export space (the offset puts the
+    turned pose back on the ground); ``p -> quat * p + offset`` is applied to the
+    root's rest transform (``rest_local_rot[0]``, ``rest_local_pos[0]``,
+    ``offsets[0]``), moving the whole rest pose rigidly. Clip frames are untouched,
+    so every clip keeps its motion and only the reference pose changes.
+    The export GLB applies the same rotation to its armature
+    (``processed_assets.export_asset_glb``), so the two stay aligned.
+
+    Idempotent like apply_root_offsets: the applied quat is stored in each NPZ under
+    ``rest_orientation_applied`` (quat then offset, 7 values); a changed entry undoes
+    the old transform first, and an
+    NPZ that carries the key but whose rig is no longer listed is restored. Returns
+    the rigs whose NPZs changed (their processed GLBs must be rebuilt).
+    """
+    src = os.path.join(patch_dir, f'{ds}_rest_orientation.json')
+    if not os.path.isfile(src):
+        return []           # no patch file: leave earlier fixes in place
+    want = load_overrides(src)
+    mdir = os.path.join(root, 'motions')
+    by_rig = {}
+    for f in glob.glob(os.path.join(mdir, '*.npz')):
+        # Mixamo clips share one rig and carry no object-type prefix.
+        rig = 'mixamo' if ds == 'mixamo' else os.path.basename(f).split('-')[0]
+        by_rig.setdefault(rig, []).append(f)
+    targets = set(want)
+    for rig, paths in by_rig.items():                       # previously fixed rigs no longer listed
+        if rig not in targets:
+            with np.load(paths[0], allow_pickle=True) as d:
+                if REST_ORIENTATION_KEY in d.files:
+                    targets.add(rig)
+    changed, n_ok = [], 0
+    for rig in sorted(targets):
+        paths = sorted(by_rig.get(rig, []))
+        if not paths:
+            log.append(f'[{ds}] rest orientation for {rig!r}: no export NPZ; ignored')
+            continue
+        new = want.get(rig)
+        fix_new = None
+        if new is not None:
+            q = np.asarray(new['quat'], dtype=np.float64)
+            fix_new = np.concatenate([q / np.linalg.norm(q),
+                                      np.asarray(new.get('offset', [0, 0, 0]), dtype=np.float64)])
+        rig_changed = False
+        for path in paths:
+            with np.load(path, allow_pickle=True) as d:
+                data = {k: d[k] for k in d.files}
+            have = data.pop(REST_ORIENTATION_KEY, None)
+            if have is not None and fix_new is not None and have.shape == fix_new.shape \
+                    and np.allclose(have, fix_new, rtol=1e-6, atol=1e-6):
+                n_ok += 1
+                continue
+            rot = data['rest_local_rot'].astype(np.float64)
+            q0, p0 = rot[0], data['rest_local_pos'][0].astype(np.float64)
+            if have is not None:                              # undo what is baked in
+                have = np.asarray(have, dtype=np.float64)
+                inv = have[:4] * np.array([1, -1, -1, -1])
+                t = have[4:7] if len(have) >= 7 else np.zeros(3)
+                q0, p0 = qmul(inv, q0), qrot(inv, p0 - t)
+            if fix_new is not None:
+                q0, p0 = qmul(fix_new[:4], q0), qrot(fix_new[:4], p0) + fix_new[4:]
+                data[REST_ORIENTATION_KEY] = fix_new
+            rot[0] = q0 / np.linalg.norm(q0)
+            data['rest_local_rot'] = rot.astype(data['rest_local_rot'].dtype)
+            for key in ('rest_local_pos', 'offsets'):
+                if key in data:
+                    arr = data[key].copy()
+                    arr[0] = p0
+                    data[key] = arr
+            if not dry_run:
+                _save_npz_atomic(path, data)
+            rig_changed = True
+        if rig_changed:
+            what = 'restored (entry removed)' if fix_new is None else \
+                f'{np.degrees(2 * np.arccos(min(1.0, abs(fix_new[0])))):.1f} deg'
+            log.append(f'[{ds}] rest orientation {rig}: {what}, {len(paths)} clip(s)'
+                       + (' (dry run)' if dry_run else ''))
+            changed.append(rig)
+    if want or changed:
+        log.append(f'[{ds}] rest_orientation: {len(want)} listed, {len(changed)} rig(s) rewritten, '
+                   f'{n_ok} clip(s) already applied')
+    return changed
+
+
+def write_rig_flags(ds, root, face, frames, manual, dry_run, log):
     """rig_flags.json (every flagged rig with its category) + filtered_objects.txt (FILTER_CATEGORIES only)."""
     flags = OrderedDict()
     for rig, entry in face.items():
@@ -662,7 +791,7 @@ def write_rig_flags(root, face, frames, manual, dry_run, log):
     for rig, fl in sorted(flags.items()):
         cats.setdefault(fl['category'], []).append(rig)
     bad = OrderedDict((rig, fl) for rig, fl in flags.items() if fl['category'] in FILTER_CATEGORIES)
-    clips = [c for c in frames if object_type_of('objaverse', c) in bad]
+    clips = [c for c in frames if object_type_of(ds, c) in bad]
     out = OrderedDict([
         ('_comment', 'Per-rig flags. Automatic facing checks (empty_pair: no bilateral joint pair; '
                      'bone_pair: the pair consists of unnamed Bone joints; body_axis_unnamed) plus the '
@@ -680,7 +809,7 @@ def write_rig_flags(root, face, frames, manual, dry_run, log):
         ('verified_ok', verified),   # automatic flags cleared by hand review
     ])
     lines = ['# Object types skipped by stage 4 (extract_features.py reads this file automatically):',
-             '# rigs flagged ' + ' / '.join(FILTER_CATEGORIES) + ' in patches/objaverse_rig_flags.txt.']
+             '# rigs flagged ' + ' / '.join(FILTER_CATEGORIES) + f' in patches/{ds}_rig_flags.txt.']
     lines += [f'#   {c}: {FILTER_CATEGORY_NOTES[c]}' for c in FILTER_CATEGORIES if c in FILTER_CATEGORY_NOTES]
     lines += ['# Other flags (empty_pair, bone_pair, facing_wrong, object_no_front, ...) are recorded in',
              '# rig_flags.json only and are NOT filtered.',
@@ -693,7 +822,7 @@ def write_rig_flags(root, face, frames, manual, dry_run, log):
             json.dump(out, f, indent=1)
         with open(os.path.join(root, 'filtered_objects.txt'), 'w') as f:
             f.write('\n'.join(lines) + '\n')
-    log.append(f'[objaverse] rig_flags.json: {dict(out["counts"])} (+{len(verified)} verified_ok); filtered_objects.txt: '
+    log.append(f'[{ds}] rig_flags.json: {dict(out["counts"])} (+{len(verified)} verified_ok); filtered_objects.txt: '
                f'{len(bad)} rigs / {len(clips)} clips ({", ".join(FILTER_CATEGORIES)})')
     return bad
 
@@ -728,7 +857,7 @@ def root_motion(root, ds, clips, cache_path, face, log):
     """Per clip: net XZ root displacement in body heights and the travel
     direction relative to the facing pair at frame 0."""
     cache = load_json(cache_path, OrderedDict()) if cache_path else OrderedDict()
-    key = lambda c: f'{ds}/{c}@{CAPTION_FRAMES}'   # window-scoped: pre-2026-09-21 full-clip rows are ignored
+    key = lambda c: f'{ds}/{c}@{CAPTION_FRAMES}'   # window-scoped: rows of other windows are ignored
     todo = [c for c in clips if key(c) not in cache]
     if todo:
         log.append(f'[{ds}] computing root motion for {len(todo)} clips')
@@ -805,6 +934,28 @@ def normalize_locomotion(caption, motion, still, travel, stats):
     return LOCO_RE.sub(repl, caption)
 
 
+def load_caption_rewrites(ds, path, caps, log):
+    """``{clip: new caption}`` from a ``caption_rewrite_llm.py`` patch: the
+    entries that passed its validation (``ok``) and whose ``old`` caption is
+    still the current one (a rewrite of a caption that changed since is stale)."""
+    out, stale = {}, 0
+    for clip, entry in load_overrides(path).items():
+        if (not isinstance(entry, dict) or not entry.get('ok') or not entry.get('new')
+                or not entry.get('old') or clip not in caps):
+            continue
+        current = caps[clip].strip().rstrip('.')
+        if current == entry['new'].strip().rstrip('.'):
+            continue                    # applied by an earlier run
+        if current != entry['old'].strip().rstrip('.'):
+            stale += 1
+            continue
+        out[clip] = entry['new']
+    if stale:
+        log.append(f'[{ds}] {stale} caption rewrites in {os.path.basename(path)} skipped: '
+                   f'the caption changed since')
+    return out
+
+
 def patch_captions(ds, caps, overrides, motion, args, stats, log):
     subject = SUBJECT[ds]
     for clip, text in (overrides or {}).items():
@@ -833,10 +984,45 @@ def patch_captions(ds, caps, overrides, motion, args, stats, log):
             stats['caption-changed'] += 1
 
 
+# Extra caption versions beside motion_captions.json (HumanML3D-style multiple
+# captions): the short generic one and the longer detail one.
+EXTRA_CAPTION_VERSIONS = ('generic', 'detail')
+
+
+def build_extra_captions(ds, version, caps, patch_dir, motion, args, stats, log):
+    """One extra caption version per clip (``generic`` or ``detail``).
+
+    The source is the reviewed patch ``<ds>_captions_<version>.json`` itself:
+    no pipeline stage generates these captions. Only clips present in the
+    export captions are kept, in their key order; the same subject / grammar /
+    locomotion rules as the normal captions run on the result. Returns None
+    when there is no patch; ``run_dataset`` then keeps an existing
+    ``motion_captions_<version>.json``.
+    """
+    src = load_overrides(os.path.join(patch_dir, f'{ds}_captions_{version}.json'))
+    if not src:
+        return None
+    unknown = [c for c in src if c not in caps]
+    if unknown:
+        log.append(f'[{ds}] {len(unknown)} {version} captions for unknown clips ignored, e.g. {unknown[:3]}')
+    out = {c: src[c] for c in caps if c in src}
+    vstats = Counter()
+    patch_captions(ds, out, None, motion, args, vstats, log)
+    for k, v in vstats.items():
+        stats[f'{version}-{k}'] += v
+    stats[f'{version}-captions'] += len(out)
+    missing = len(caps) - len(out)
+    if missing:
+        stats[f'{version}-missing'] += missing
+    return out
+
+
 # ---------------------------------------------------------------------------
 
-def write_report(ds, report_dir, before, clean, face, caps, names, motion):
-    """TSV of every change: kind, key, joint/-, old, new, note."""
+def write_report(ds, report_dir, before, clean, face, caps, names, motion, extra=None):
+    """TSV of every change: kind, key, joint/-, old, new, note. Extra caption
+    versions (``extra``: {version: {clip: caption} or None}) are compared with
+    their export files as they were before this run (kind ``caption_<v>``)."""
     os.makedirs(report_dir, exist_ok=True)
     rows = []
     for rig, labels in clean.items():
@@ -855,6 +1041,14 @@ def write_report(ds, report_dir, before, clean, face, caps, names, motion):
             m = motion.get(clip, {})
             note = f"net={m.get('net')} dir={m.get('dir')}" if m else ''
             rows.append(('caption', clip, '-', o, text, note))
+    for version, new in (extra or {}).items():
+        if new is None:         # no patch: the file is kept, nothing changes
+            continue
+        old = before.get('extra', {}).get(version) or {}
+        new = new or {}
+        for clip in list(new) + [c for c in old if c not in new]:
+            if old.get(clip) != new.get(clip):
+                rows.append((f'caption_{version}', clip, '-', old.get(clip), new.get(clip), ''))
     path = os.path.join(report_dir, f'{ds}_changes.tsv')
     with open(path, 'w') as f:
         f.write('kind\tkey\tjoint\told\tnew\tnote\n')
@@ -877,15 +1071,21 @@ def run_dataset(ds, args, log):
     pd = args.patch_dir
     stats = Counter()
     before = {'clean': json.loads(json.dumps(clean)), 'face': json.loads(json.dumps(face)) if face else {},
-              'caps': dict(caps) if caps else {}}
+              'caps': dict(caps) if caps else {},
+              'extra': {v: load_json(os.path.join(root, f'motion_captions_{v}.json'))
+                        for v in EXTRA_CAPTION_VERSIONS}}
 
     patch_joint_labels(ds, root, clean, names, load_overrides(os.path.join(pd, f'{ds}_joint_labels.json')), stats, log)
     if face is not None:
         patch_face_pairs(ds, face, clean, names, load_overrides(os.path.join(pd, f'{ds}_face_pairs.json')), stats, log)
-        if ds == 'objaverse':
-            manual = load_rig_flags(os.path.join(pd, f'{ds}_rig_flags.txt'), names, log)
-            write_rig_flags(root, face, frames, manual, args.dry_run, log)
+        flags_src = os.path.join(pd, f'{ds}_rig_flags.txt')
+        if ds in OBJECT_DATASETS and os.path.isfile(flags_src):
+            manual = load_rig_flags(ds, flags_src, names, log)
+            write_rig_flags(ds, root, face, frames, manual, args.dry_run, log)
             stats['manual-rig-flag'] += len(manual)
+        elif ds in OBJECT_DATASETS:
+            log.append(f'[{ds}] no {ds}_rig_flags.txt in {pd}; rig_flags.json / '
+                       f'filtered_objects.txt left as they are')
     stats['manual-filtered-clip'] += len(
         write_filtered_clips(ds, root, pd, frames, args.dry_run, log))
     stats['manual-clip-trim'] += len(
@@ -894,6 +1094,8 @@ def run_dataset(ds, args, log):
         write_activity_keep(ds, root, pd, frames, args.dry_run, log))
     rewritten = apply_root_offsets(ds, root, pd, args.dry_run, log)
     stats['root-offset-rewritten'] += len(rewritten)
+    stats['rest-orientation-rewritten'] += len(
+        apply_rest_orientations(ds, root, pd, args.dry_run, log))
     if rewritten and not args.dry_run:
         # the cached travel direction was measured against the old (tilted) facing
         cache_path = os.path.join(pd, '.root_motion_cache.json')
@@ -905,21 +1107,35 @@ def run_dataset(ds, args, log):
             save_json(cache_path, cache, False)
     if groups is not None:
         patch_categories(ds, groups, load_overrides(os.path.join(pd, f'{ds}_categories.json')), names, stats, log)
+    extra = {}
     if caps is not None:
         motion = root_motion(root, ds, list(caps), os.path.join(pd, '.root_motion_cache.json'),
                              face or {}, log) if not args.skip_locomotion else {}
-        patch_captions(ds, caps, load_overrides(os.path.join(pd, f'{ds}_captions.json')), motion, args, stats, log)
+        overrides = load_caption_rewrites(ds, os.path.join(pd, f'{ds}_captions_llm.json'), caps, log)
+        overrides.update(load_overrides(os.path.join(pd, f'{ds}_captions.json')))
+        patch_captions(ds, caps, overrides, motion, args, stats, log)
+        extra = {v: build_extra_captions(ds, v, caps, pd, motion, args, stats, log)
+                 for v in EXTRA_CAPTION_VERSIONS}
 
     save_json(os.path.join(root, 'clean_joint_names.json'), clean, args.dry_run)
     if face is not None:
         save_json(os.path.join(root, 'face_joint_names.json'), face, args.dry_run)
     if caps is not None:
         save_json(os.path.join(root, 'motion_captions.json'), caps, args.dry_run)
+    for version in EXTRA_CAPTION_VERSIONS:
+        path = os.path.join(root, f'motion_captions_{version}.json')
+        if extra.get(version) is not None:
+            save_json(path, extra[version], args.dry_run)
+        elif caps is not None and os.path.isfile(path):
+            # No patch file: keep the captions an earlier run (or the released
+            # export) wrote; deleting them is a manual decision.
+            log.append(f'[{ds}] no {ds}_captions_{version}.json in {pd}; kept {path}')
     if groups is not None:
         save_json(os.path.join(root, 'category_groups.json'), groups, args.dry_run)
     if args.report_dir:
         write_report(ds, args.report_dir, before, clean, face or {}, caps or {}, names,
-                     motion if caps is not None and not args.skip_locomotion else {})
+                     motion if caps is not None and not args.skip_locomotion else {},
+                     extra=extra)
     log.append(f'[{ds}] ' + ', '.join(f'{k}={v}' for k, v in sorted(stats.items())))
 
 
@@ -937,7 +1153,8 @@ def main():
     ap.add_argument('--skip_locomotion', action='store_true', help='do not touch forward/in place')
     ap.add_argument('--report_dir', default=None,
                     help='write <ds>_changes.tsv (every label / face / caption change) here')
-    ap.add_argument('--dry_run', action='store_true', help='report only, write nothing')
+    ap.add_argument('--dry_run', action='store_true', help='report only; writes nothing but the root-motion cache '
+                         '(<patch_dir>/.root_motion_cache.json)')
     args = ap.parse_args()
     os.makedirs(args.patch_dir, exist_ok=True)
     log = []
@@ -945,8 +1162,9 @@ def main():
         run_dataset(ds, args, log)
     print('\n'.join(log))
     if args.dry_run:
-        print('(dry run — nothing written)')
+        print('(dry run — no annotation written; only the root-motion cache)')
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

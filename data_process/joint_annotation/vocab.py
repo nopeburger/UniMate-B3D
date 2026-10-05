@@ -156,6 +156,9 @@ CANONICAL = {
     "Controller": "", "Controler": "", "Ctrl": "", "Quick": "",
     "Untitled": "", "Pasted": "",
     "Bind": "", "Skeleton": "", "Reference": "", "Res": "", "Main": "",
+    # URDF robots: every body is a '<part>_link', joints split per axis
+    # ('left_hip_pitch_link' -> the part alone).
+    "Link": "", "Pitch": "", "Roll": "", "Yaw": "",
     # UE-style per-finger segment words: chain position, not anatomy
     # ('IndexDistal', 'thumb_proximal_l' -> the finger label alone).
     "Metacarpal": "", "Proximal": "", "Intermediate": "", "Medial": "",
@@ -180,6 +183,9 @@ STANDALONE_MAP = {
     "BN_P": "Belly",
     "Hips": "Hips", "Spine": "Spine", "Head": "Head",
     "Trajectory": "Root",
+    # A joint named only 'base' is mostly the root; inside a name the word
+    # is a modifier ('ToeBase').
+    "Base": "Root", "base": "Root",
     "RightArm": "Right Upper Arm", "RightForeArm": "Right Forearm",
     "LeftArm": "Left Upper Arm", "LeftForeArm": "Left Forearm",
     # Standalone mixamo-style chain: bare "Leg" is the shin (see MIXAMO_MAP).
@@ -404,20 +410,83 @@ SPIDER_MAP = {
 # ---------------------------------------------------------------------------
 # Canonical label format — ONE format shared by truebones / mixamo / objaverse
 #
-#     label := [Left |Right ] <part> [ End]
+#     label := [Left |Right ] [<qualifier> ] <part> [ End]
 #
-# where <part> is any base label the maps above emit (qualifiers like
-# Front/Hind/Inner/Middle/Outer/Upper/Lower are already baked into those
-# values: 'Front Leg', 'Upper Eyelid', ...) and ' End' marks a chain tip
-# (Nub/Tip/*_End sources). Two sentinels sit outside the grammar:
+# where <part> is any base label the maps above emit, plus PROMPT_PARTS and
+# REVIEW_PARTS; <qualifier> is one of QUALIFIERS ('Right Front Toe',
+# 'Back Hip', 'Inner Claw'), the composed form names_clean_llm's prompt
+# allows; and ' End' marks a chain tip (Nub/Tip/*_End sources). Some
+# qualified forms are parts in their own right ('Front Leg', 'Upper
+# Eyelid'). Two sentinels sit outside the grammar:
 #   - "Bone"       placeholder for rig noise with no recognizable anatomy
 #   - "_00", "12"  numeric passthrough for rigs whose bones were never named
 # ---------------------------------------------------------------------------
 
+# Non-anatomical parts that hand-reviewed joint labels use (a closed list:
+# garments and carried items, plant parts, object parts). No raw-name rule emits them, so they are not in the maps above; they
+# reach clean_joint_names.json only through patches/<ds>_joint_labels.json.
+REVIEW_PARTS = (
+    "Hair", "Cape", "Skirt", "Cloth", "Hat", "Scarf", "Belt", "Bag", "Strap",
+    "Weapon", "Shield", "Prop",
+    "Stem", "Leaf", "Petal", "Branch",
+    "Base", "Lid", "Door", "Wheel", "Propeller", "Lever", "Chain", "Rope",
+)
+
+# Terms names_clean_llm's prompt lists in its CANONICAL VOCABULARY that no rule
+# map emits; without them the LLM's own vocabulary would fail the check.
+PROMPT_PARTS = (
+    "Upper Body", "Waist", "Collar", "Paw", "Upper Jaw", "Lower Jaw", "Lower Lip",
+    "Front Paw", "Back Paw", "Front Shoulder", "Back Hip", "Thigh Twist", "Shin Twist",
+)
+
+# Side words inside a raw name (whole tokens, lower case): English and the
+# Spanish, Portuguese, French, German and Italian words rigs use.
+SIDE_WORDS = {
+    'right': 'Right', 'der': 'Right', 'derecha': 'Right', 'derecho': 'Right',
+    'dcha': 'Right', 'direita': 'Right', 'direito': 'Right', 'droite': 'Right',
+    'droit': 'Right', 'rechts': 'Right', 'destra': 'Right', 'destro': 'Right',
+    'left': 'Left', 'izq': 'Left', 'izquierda': 'Left', 'izquierdo': 'Left',
+    'izda': 'Left', 'iz': 'Left', 'esquerda': 'Left', 'esquerdo': 'Left',
+    'gauche': 'Left', 'links': 'Left', 'sinistra': 'Left', 'sinistro': 'Left',
+}
+
+# Body parts in those languages (lower case, accents dropped) -> canonical part.
+FOREIGN_PARTS = {
+    # Spanish
+    'brazo': 'Upper Arm', 'antebrazo': 'Forearm', 'pierna': 'Leg', 'muslo': 'Thigh',
+    'pie': 'Foot', 'mano': 'Hand', 'cabeza': 'Head', 'cuello': 'Neck', 'hombro': 'Shoulder',
+    'codo': 'Elbow', 'rodilla': 'Knee', 'ala': 'Wing', 'alas': 'Wing', 'cola': 'Tail',
+    'dedo': 'Finger', 'tobillo': 'Ankle', 'cadera': 'Hips', 'pecho': 'Chest',
+    # Portuguese
+    'braco': 'Upper Arm', 'perna': 'Leg', 'coxa': 'Thigh', 'mao': 'Hand',
+    'cabeca': 'Head', 'pescoco': 'Neck', 'ombro': 'Shoulder', 'cotovelo': 'Elbow',
+    'joelho': 'Knee', 'asa': 'Wing', 'cauda': 'Tail', 'quadril': 'Hips',
+    # French
+    'bras': 'Upper Arm', 'avantbras': 'Forearm', 'jambe': 'Leg', 'cuisse': 'Thigh',
+    'pied': 'Foot', 'main': 'Hand', 'tete': 'Head', 'cou': 'Neck', 'epaule': 'Shoulder',
+    'coude': 'Elbow', 'genou': 'Knee', 'aile': 'Wing', 'queue': 'Tail', 'hanche': 'Hips',
+    # German
+    'bein': 'Leg', 'oberschenkel': 'Thigh', 'fuss': 'Foot',
+    'kopf': 'Head', 'hals': 'Neck', 'schulter': 'Shoulder', 'knie': 'Knee',
+    'flugel': 'Wing', 'schwanz': 'Tail',
+    # Italian
+    'braccio': 'Upper Arm', 'gamba': 'Leg', 'coscia': 'Thigh', 'piede': 'Foot',
+    'testa': 'Head', 'collo': 'Neck', 'spalla': 'Shoulder', 'gomito': 'Elbow',
+    'ginocchio': 'Knee', 'coda': 'Tail',
+    # Slavic, Vietnamese and pinyin words seen in rigs
+    'hvost': 'Tail', 'khvost': 'Tail', 'uho': 'Ear', 'ucho': 'Ear', 'hobot': 'Appendage',
+    'canh': 'Wing', 'chibang': 'Wing', 'weiba': 'Tail', 'datui': 'Thigh', 'xiaotui': 'Shin',
+    'dabi': 'Upper Arm', 'xiaobi': 'Forearm',
+}
+
+# Position qualifiers allowed between the side and the part.
+QUALIFIERS = ("Front", "Back", "Middle", "Rear", "Hind", "Inner", "Outer", "Upper", "Lower")
+
+
 def canonical_parts():
     """Base part labels (side stripped) that the vocabulary can emit."""
     import re as _re
-    parts = set()
+    parts = set(REVIEW_PARTS) | set(PROMPT_PARTS)
     for mapping in (CANONICAL, MIXAMO_MAP, NPC_DIRECT, ELK_MAP, JT_MAP,
                     SPIDER_MAP, STANDALONE_MAP, SABRECAT_MAP,
                     PIRRANA_COMPOUNDS, JAPANESE_WORDS):
@@ -436,4 +505,7 @@ def is_canonical_label(label, _parts_cache=[]):
         return True
     base = _re.sub(r'^(Left|Right)\s+', '', label)
     base = _re.sub(r'\s+End$', '', base)
-    return base in _parts_cache[0]
+    if base in _parts_cache[0]:
+        return True
+    head, _, rest = base.partition(' ')
+    return head in QUALIFIERS and rest in _parts_cache[0]

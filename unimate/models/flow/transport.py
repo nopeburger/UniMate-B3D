@@ -59,6 +59,11 @@ class Transport:
         lambda_geo: weight for the auxiliary geodesic rotation loss.
         lambda_smooth: weight for the auxiliary velocity smoothness loss
             (penalizes Δ on the local-velocity channels of the predicted x1).
+        t_sampling: training-time distribution — 'uniform' (U[t0, t1]) or
+            'logit_normal' (t = sigmoid(m + s·z), z ~ N(0, 1), Esser et al.
+            2024), rescaled to [t0, t1].
+        t_logit_mean / t_logit_std: m and s of the logit-normal. With t = 0
+            noise and t = 1 data, m > 0 shifts samples toward the data end.
     """
 
     def __init__(
@@ -71,6 +76,9 @@ class Transport:
         sample_eps,
         lambda_geo=0.0,
         lambda_smooth=0.0,
+        t_sampling="uniform",
+        t_logit_mean=0.0,
+        t_logit_std=1.0,
     ):
         path_options = {
             PathType.LINEAR: path.ICPlan,
@@ -85,6 +93,11 @@ class Transport:
         self.sample_eps = sample_eps
         self.lambda_geo = lambda_geo
         self.lambda_smooth = lambda_smooth
+        if t_sampling not in ("uniform", "logit_normal"):
+            raise ValueError(f"Unknown t_sampling: {t_sampling!r}")
+        self.t_sampling = t_sampling
+        self.t_logit_mean = t_logit_mean
+        self.t_logit_std = t_logit_std
 
         self.l2_loss = lambda a, b: (a - b) ** 2
 
@@ -203,11 +216,16 @@ class Transport:
         Args:
             x1: data point, shape (B, *dim).
         Returns:
-            (t, x0, x1) where x0 ~ N(0, I), t ~ U[t0, t1].
+            (t, x0, x1) where x0 ~ N(0, I) and t follows ``t_sampling`` on
+            [t0, t1].
         """
         x0 = th.randn_like(x1)
         t0, t1 = self.check_interval(self.train_eps, self.sample_eps)
-        t = th.rand((x1.shape[0],)) * (t1 - t0) + t0
+        if self.t_sampling == "logit_normal":
+            u = th.sigmoid(self.t_logit_mean + self.t_logit_std * th.randn((x1.shape[0],)))
+        else:
+            u = th.rand((x1.shape[0],))
+        t = u * (t1 - t0) + t0
         t = t.to(x1)
         return t, x0, x1
 

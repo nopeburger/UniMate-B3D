@@ -7,8 +7,9 @@ the lateral (left-right) axis used to compute the facing direction:
      pair, preferring anatomically meaningful joints (Thigh, Shoulder, ...).
   2. For body-axis animals (snakes like Anaconda) that lack bilateral
      symmetry, use longitudinal body-axis endpoints (tail-tip / head-tip)
-     and flag ``"body_axis": true``. The tail-to-head vector is directly
-     the facing direction (no cross product with Y-up needed).
+     and flag ``"body_axis": true``. Stage 4 turns the tail-to-head vector
+     by -90 degrees about Y before the usual cross product with Y-up, so it
+     ends up as the facing direction.
   3. Animals with opaque joint names where no meaningful pair can be
      extracted get ``"source": "empty"``.
 
@@ -180,10 +181,13 @@ def _match_pair_by_suffix(
 def find_symmetric_pair(
     clean_names: List[str],
     raw_names: List[str],
+    usable=None,
 ) -> Tuple[Optional[int], Optional[int], Optional[str]]:
     """Find the highest-priority "Right <X>" / "Left <X>" pair.
 
-    Returns ``(r_idx, l_idx, suffix)`` or ``(None, None, None)``.
+    *usable* ``(r_idx, l_idx) -> bool`` rejects a pair (e.g. one without
+    horizontal separation in the rest pose); the next part in priority order
+    is tried. Returns ``(r_idx, l_idx, suffix)`` or ``(None, None, None)``.
     """
     right_map: Dict[str, List[int]] = {}
     left_map: Dict[str, List[int]] = {}
@@ -199,9 +203,11 @@ def find_symmetric_pair(
 
     ordered = [s for s in SYMMETRIC_PAIR_PRIORITY if s in common]
     ordered += sorted(common - set(SYMMETRIC_PAIR_PRIORITY))
-    suffix = ordered[0]
-    ri, li = _match_pair_by_suffix(right_map[suffix], left_map[suffix], raw_names)
-    return ri, li, suffix
+    for suffix in ordered:
+        ri, li = _match_pair_by_suffix(right_map[suffix], left_map[suffix], raw_names)
+        if usable is None or usable(ri, li):
+            return ri, li, suffix
+    return None, None, None
 
 
 def find_body_axis_pair(
@@ -259,9 +265,11 @@ def _make_entry(
 def resolve_face_joints(
     clean_names: List[str],
     raw_names: List[str],
+    usable=None,
 ) -> Dict:
-    """Resolve one joint pair defining the facing direction."""
-    r_idx, l_idx, suffix = find_symmetric_pair(clean_names, raw_names)
+    """Resolve one joint pair defining the facing direction (*usable*: see
+    ``find_symmetric_pair``)."""
+    r_idx, l_idx, suffix = find_symmetric_pair(clean_names, raw_names, usable)
     if r_idx is not None:
         return _make_entry(raw_names, clean_names, r_idx, l_idx, suffix.lower())
 

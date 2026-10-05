@@ -15,14 +15,26 @@ so the seam frames appear once and motion continuity is enforced by the
 flow ODE's clamping (same machinery as in-betweening — only the mask
 construction differs).
 
+The model only ever saw windows whose frame 0 faces +Z (stage-4
+canonicalization, ``realign_unimate_clip`` after a crop). The tail of a
+segment that turned does not, so each seed is re-aligned to its own frame 0
+before sampling, and the new segment is rotated back into the chain's frame
+afterwards. RIFKE positions and local velocities live in the per-frame
+facing frame, so only the rotation channels change and the trajectory stays
+continuous across the seam.
+
 Total length: ``max_T + (max_T - overlap) * (N - 1)``.
 """
 
 from typing import List
 
+import numpy as np
 import torch
+from Quaternions import Quaternions
 
 from unimate.utils.logger import get_logger
+from unimate.utils.motion_utils import rotate_unimate_facing
+from unimate.utils.rotation_conversions import matrix_to_quaternion_np, rotation_6d_to_matrix_np
 from unimate.inference.generate import generate_samples
 
 logger = get_logger(file_name=__file__)
@@ -59,6 +71,46 @@ def seed_expansion_x1(
     x1 = torch.zeros(motion_shape, device=device)
     x1[:, :, :, :overlap] = prev_seq[:, :, :, -overlap:]
     return x1
+
+
+# Normalized channels whose std is below this are constant by construction
+# (root X/Z and the yaw-only facing's fixed 6-D entries; their std is floored
+# at 1e-8). Facing rotations leave them unchanged, and renormalizing them
+# would only amplify float error, so they keep their normalized values.
+_CONST_STD = 1e-6
+
+
+def rotate_segment_facing(seq, cond, q_per_sample):
+    """Apply :func:`rotate_unimate_facing` to every sample of a batch.
+
+    Args:
+        seq: normalized motion ``(B, J, D, T)``.
+        cond: conditioning dict with ``mean`` / ``std`` ``(B, J, D)``,
+            ``n_joints`` ``(B,)`` and ``parents`` (list of ``(J_i,)``).
+        q_per_sample: one single-element ``Quaternions`` per sample.
+
+    Returns:
+        Normalized ``(B, J, D, T)`` motion with the rotated facing; padded
+        joints are left untouched.
+    """
+    out = seq.clone()
+    for b, q in enumerate(q_per_sample):
+        nj = int(cond['n_joints'][b])
+        mean = cond['mean'][b, :nj].double().cpu().numpy()[None]   # (1, J, D)
+        std = cond['std'][b, :nj].double().cpu().numpy()[None]
+        norm = seq[b, :nj].double().cpu().numpy().transpose(2, 0, 1)  # (T, J, D)
+        rotated = rotate_unimate_facing(norm * std + mean, cond['parents'][b], q)
+        renorm = np.where(std < _CONST_STD, norm, (rotated - mean) / std)
+        out[b, :nj] = torch.from_numpy(renorm.transpose(1, 2, 0)).to(seq)
+    return out
+
+
+def first_frame_facing(seq, cond):
+    """Frame-0 root facing of each sample of a normalized ``(B, J, D, T)`` batch."""
+    root_6d = seq[:, 0, 3:9, 0].double() * cond['std'][:, 0, 3:9].double() \
+        + cond['mean'][:, 0, 3:9].double()                          # (B, 6)
+    mats = rotation_6d_to_matrix_np(root_6d.cpu().numpy())
+    return [Quaternions(matrix_to_quaternion_np(m[None]))[0] for m in mats]
 
 
 # ---------------------------------------------------------------------------
@@ -111,8 +163,14 @@ def expand_motion_chain(
         if prev_seq is None:
             x1_known = None
             keep_mask = None
+            q_seed = None
         else:
-            x1_known = seed_expansion_x1(prev_seq, overlap, motion_shape, device)
+            # Seed in the frame the model was trained on: the tail's own
+            # frame 0 faces +Z.
+            tail = prev_seq[:, :, :, -overlap:]
+            q_seed = first_frame_facing(tail, cond)
+            tail = rotate_segment_facing(tail, cond, q_seed)
+            x1_known = seed_expansion_x1(tail, overlap, motion_shape, device)
             keep_mask = build_overlap_keep_mask(
                 motion_shape[0], overlap, max_T, device,
             )
@@ -129,6 +187,10 @@ def expand_motion_chain(
             x1_known=x1_known,
             keep_mask=keep_mask,
         )
+        if q_seed is not None:
+            # Back into the chain's frame; the pinned overlap then reproduces
+            # the previous segment's tail.
+            sample = rotate_segment_facing(sample, cond, [-q for q in q_seed])
         segments.append(sample)
         prev_seq = sample
         logger.info(

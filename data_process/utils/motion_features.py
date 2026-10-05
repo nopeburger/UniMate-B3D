@@ -48,6 +48,7 @@ from data_process.utils.topology import (
     compute_laplacian_eigenvectors,
 )
 from data_process.utils.skeleton import (
+    DegenerateSkeletonError,
     reorder_anim_bfs,
     get_root_facing_quat,
     canonicalize_anim,
@@ -80,14 +81,6 @@ MIN_SKELETON_DIAMETER = 1e-8
 # relative type size, exactly as it was.
 PREVIEW_FIGSIZE = (6.4, 6.4)
 PREVIEW_DPI = 150
-
-
-class DegenerateSkeletonError(ValueError):
-    """Raised when a T-pose cannot be canonicalized (e.g. zero-length bones).
-
-    Callers treat this as a skip-with-reason for the whole object type rather
-    than a hard failure.
-    """
 
 
 # ===========================================================================
@@ -309,10 +302,11 @@ def load_and_canonicalize_motion(object_npz_path, raw_parents, raw_njoints,
                                  body_axis=False, raw_names=None, head_trim=0):
     """Load a motion NPZ and canonicalize facing / XZ / ground + scale.
 
-    ``scale_factor`` and ``ground_height`` are reused from T-pose
-    calibration so every motion of this object type shares a
-    diameter-consistent scale and a consistent floor height (matching the
-    npz pipeline); ``root_pose_init_xz`` is recomputed fresh per
+    ``scale_factor`` is reused from the T-pose calibration so every motion of
+    this object type shares a diameter-consistent scale. ``ground_height`` is
+    the T-pose's floor when the caller reuses it (``use_tpos_ground_height``),
+    else None: the motion is grounded on its own minimum Y (the default).
+    ``root_pose_init_xz`` is recomputed fresh per
     motion so each motion starts centered at the origin. Clips are then
     simple slices of the canonicalized motion.
 
@@ -326,11 +320,14 @@ def load_and_canonicalize_motion(object_npz_path, raw_parents, raw_njoints,
     if motion_anim is None:
         return None, skip_reason
 
-    motion_anim, _, _, _ = canonicalize_anim(
-        motion_anim,
-        face_joint_idxs=face_joint_idxs, body_axis=body_axis,
-        ground_height=ground_height,
-        scale_factor=scale_factor)
+    try:
+        motion_anim, _, _, _ = canonicalize_anim(
+            motion_anim,
+            face_joint_idxs=face_joint_idxs, body_axis=body_axis,
+            ground_height=ground_height,
+            scale_factor=scale_factor)
+    except DegenerateSkeletonError as e:
+        return None, f'no facing in any frame: {e}'
     return (motion_anim, motion_fps), None
 
 
@@ -504,7 +501,8 @@ def _activity_below_threshold(global_positions, threshold):
 
 
 def _discontinuity_metrics(global_positions):
-    """Per-frame mean joint displacement in body units, plus its median / max.
+    """Per-frame mean joint displacement in clip extents (the largest side of
+    the box the whole clip sweeps, root travel included), plus its median / max.
 
     A clip stitched together from several actions (or one with a teleporting
     root) shows a single frame whose displacement dwarfs the rest of the clip.
@@ -524,7 +522,7 @@ def _discontinuity_above_threshold(global_positions, step_threshold, ratio_thres
     """Return (is_discontinuous, metrics).
 
     Flags a clip when one frame moves the skeleton at least *step_threshold*
-    body lengths AND that step is at least *ratio_threshold* times the clip's
+    clip extents (see :func:`_discontinuity_metrics`) AND that step is at least *ratio_threshold* times the clip's
     median step — the signature of concatenated actions, not of fast motion,
     which raises the median too. Non-finite input counts as discontinuous.
     ``step_threshold <= 0`` disables the filter (non-finite input is still
@@ -674,7 +672,7 @@ def _process_motion_file(object_npz_path, ctx):
     motion_anim, _, _ = trim_static_ends(
         motion_anim, static_threshold=ctx['static_threshold'])
     if len(motion_anim) < min_frames:
-        reason = (f'too few frames after static trim'
+        reason = ('too few frames after static trim'
                   + (f' (after a {head_trim}-frame head trim)' if head_trim else '')
                   + f': {len(motion_anim)} < {min_frames} (orig {orig_nframes})')
         return {'n_saved': 0, 'frames': 0, 'clip_captions': {},
@@ -688,12 +686,17 @@ def _process_motion_file(object_npz_path, ctx):
 
     clip_captions, filtered, n_saved, frames = {}, [], 0, 0
     for clip_idx, (clip_start, clip_end) in enumerate(clips):
-        (clip_local_rotations, clip_global_positions,
-         clip_root_facing_quat) = extract_clip_feats(
-            motion_anim, clip_start, clip_end,
-            ctx['face_joint_idxs'],
-            body_axis=ctx['body_axis'],
-        )
+        try:
+            (clip_local_rotations, clip_global_positions,
+             clip_root_facing_quat) = extract_clip_feats(
+                motion_anim, clip_start, clip_end,
+                ctx['face_joint_idxs'],
+                body_axis=ctx['body_axis'],
+            )
+        except DegenerateSkeletonError as e:
+            filtered.append({'name': f'{base_name}-{clip_idx:03d}',
+                             'reason': f'no facing in any frame: {e}'})
+            continue
 
         is_low, clip_metrics = _activity_below_threshold(
             clip_global_positions, ctx['activity_threshold'])

@@ -3,17 +3,35 @@
 # and export GLB + FBX (batch front-end for stage 5 of data_process/).
 #
 # Usage:
+#   bash scripts/run_animate_motion.sh <SAMPLES_DIR> [OUTPUT_DIR]
 #   bash scripts/run_animate_motion.sh <DATASET_TYPE> <INPUT...> [OUTPUT_DIR]
 #   bash scripts/run_animate_motion.sh -h | --help
 #
-# DATASET_TYPE:  truebones | objaverse | mixamo
+# SAMPLES_DIR:   a sampler output directory (holding manifest.json, written by
+#                unimate.inference.sample): every motion drives the canonical GLB of
+#                the asset it was generated for, with that asset's cond; the joint
+#                order of motion, cond and GLB is checked first (data_process/
+#                mesh_animation/sample_manifest.py). OUTPUT_DIR defaults to
+#                <SAMPLES_DIR>/animated. INCLUDE_GT=1 also drives the saved ground
+#                truth of in-betweening / motion editing; CHAR_PATH overrides the
+#                character of every motion; SKIP_INVALID=1 drives the motions that
+#                pass the check and reports the others. A directory whose manifest
+#                is in its one mode subdirectory (inbetween/, motion_edit/,
+#                motion_expand/) works too.
+#
+# DATASET_TYPE:  truebones | objaverse | mixamo | general
 # INPUT...:      one or more .npy / .npz files, or a single directory containing them
 # OUTPUT_DIR:    directory to save .glb / .fbx outputs (default: outputs/animated)
 #                Detected as the last arg when it does not end in .npy / .npz.
 #
 # Env overrides:
-#   ANIM_MODE (default: fk), CHAR_PATH (default: auto; mixamo falls back to
-#   dataset/raw/mixamo/character_refined/Y_Bot.fbx),
+#   ANIM_MODE (default: fk), CHAR_PATH (default: auto, by ASSET),
+#   ASSET (canonical, the default: the canonical asset
+#   dataset/canonical_assets/<DATASET_TYPE>/<object_type>.glb at canonical scale,
+#   falling back to export when missing; export: the processed asset
+#   dataset/export/<DATASET_TYPE>/rigs/<object_type>.glb, else the raw one),
+#   CANONICAL (1: canonical required, no fallback; 0: same as ASSET=export),
+#   CHARACTER (mixamo character, default Michelle; also in manifest mode),
 #   COND_PATH (default: dataset/features/<DATASET_TYPE>/cond.npy),
 #   EXTRA_BONES_STRATEGY (merge|remove|keep, default: merge)
 #
@@ -34,6 +52,47 @@ if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     exit 0
 fi
 
+if [ "$#" -ge 1 ] && { [ -f "$1/manifest.json" ] || [[ "$1" == *.json && -f "$1" ]] \
+        || compgen -G "$1/*/manifest.json" >/dev/null; }; then
+    MANIFEST_SRC="$1"
+    if [ -d "$MANIFEST_SRC" ]; then SAMPLES_DIR="$MANIFEST_SRC"; else SAMPLES_DIR="$(dirname "$MANIFEST_SRC")"; fi
+    OUTPUT_DIR="${2:-$SAMPLES_DIR/animated}"
+    LIST_ARGS=("$MANIFEST_SRC")
+    [ "${INCLUDE_GT:-0}" = 1 ] && LIST_ARGS+=(--include_gt)
+    [ -n "${CHAR_PATH:-}" ] && LIST_ARGS+=(--char_path "$CHAR_PATH")
+    [ -n "${CHARACTER:-}" ] && LIST_ARGS+=(--character "$CHARACTER")
+    [ "${SKIP_INVALID:-0}" = 1 ] && LIST_ARGS+=(--skip_invalid)
+    if command -v conda >/dev/null 2>&1; then
+        eval "$(conda shell.bash hook 2>/dev/null)"
+        conda activate "${CONDA_ENV:-unimate}" 2>/dev/null || true
+    fi
+    JOBS=$(python -m data_process.mesh_animation.sample_manifest "${LIST_ARGS[@]}")
+    mkdir -p "$OUTPUT_DIR"
+    TOTAL=$(printf '%s\n' "$JOBS" | grep -c .)
+    echo "============================================================"
+    echo "MANIFEST     = $MANIFEST_SRC   (${TOTAL} motion(s))"
+    echo "OUTPUT_DIR   = $OUTPUT_DIR"
+    echo "============================================================"
+    i=0
+    while IFS=$'\t' read -r anim char cond dtype; do
+        i=$((i + 1))
+        stem=$(basename "${anim%.*}")
+        echo "# [$i/$TOTAL] $stem  (char=$char, cond=$cond, dataset_type=$dtype)"
+        started=$(date +%s)
+        # ASSET here is the stage-5 character kind, not the sampler's asset list
+        ANIM_PATH="$anim" CHAR_PATH="$char" COND_PATH="$cond" OUTPUT_DIR="$OUTPUT_DIR" \
+            ANIM_MODE="${ANIM_MODE:-fk}" EXTRA_BONES_STRATEGY="${EXTRA_BONES_STRATEGY:-merge}" \
+            ASSET=canonical CANONICAL= CHARACTER= bash "$STAGE1_WRAPPER" "$dtype" </dev/null
+        out="$OUTPUT_DIR/$stem.fbx"
+        if [ ! -f "$out" ] || [ "$(stat -c %Y "$out" 2>/dev/null || stat -f %m "$out")" -lt "$started" ]; then
+            echo "ERROR: did not produce expected FBX at '$out'" >&2
+            exit 1
+        fi
+    done <<< "$JOBS"
+    echo "BATCH DONE — ${TOTAL} motion(s) animated into $OUTPUT_DIR"
+    exit 0
+fi
+
 if [ "$#" -lt 2 ]; then
     echo "ERROR: expected at least 2 positional args: <DATASET_TYPE> <INPUT...> [OUTPUT_DIR]" >&2
     echo "Usage: bash $(basename "$0") <DATASET_TYPE> <INPUT...> [OUTPUT_DIR]" >&2
@@ -44,9 +103,9 @@ DATASET_TYPE="$1"
 shift
 
 case "$DATASET_TYPE" in
-    truebones|objaverse|mixamo) ;;
+    truebones|objaverse|mixamo|general) ;;
     *)
-        echo "ERROR: unknown DATASET_TYPE='$DATASET_TYPE' (expected: truebones | objaverse | mixamo)" >&2
+        echo "ERROR: unknown DATASET_TYPE='$DATASET_TYPE' (expected: truebones | objaverse | mixamo | general)" >&2
         exit 1
         ;;
 esac
@@ -119,8 +178,11 @@ process_one_motion() {
     echo "#   DATASET_TYPE = $DATASET_TYPE"
     echo "#   OUTPUT_DIR   = $OUTPUT_DIR"
     echo "#   ANIM_MODE    = $ANIM_MODE"
-    echo "#   CHAR_PATH    = ${CHAR_PATH:-<auto>}"
+    echo "#   CHAR_PATH    = ${CHAR_PATH:-<auto, ASSET=${ASSET:-canonical}>}${CHARACTER:+ (CHARACTER=$CHARACTER)}${CANONICAL:+ (CANONICAL=$CANONICAL)}"
     echo "############################################################"
+    # An FBX left by an earlier run must not count as this run's output.
+    local started
+    started=$(date +%s)
     (
         export OUTPUT_DIR ANIM_MODE
         export ANIM_PATH="$anim_path"
@@ -133,10 +195,19 @@ process_one_motion() {
         if [ -n "${EXTRA_BONES_STRATEGY:-}" ]; then
             export EXTRA_BONES_STRATEGY
         fi
+        if [ -n "${CHARACTER:-}" ]; then
+            export CHARACTER
+        fi
+        if [ -n "${CANONICAL:-}" ]; then
+            export CANONICAL
+        fi
+        if [ -n "${ASSET:-}" ]; then
+            export ASSET
+        fi
         bash "$STAGE1_WRAPPER" "$DATASET_TYPE"
     )
 
-    if [ ! -f "$exported_fbx" ]; then
+    if [ ! -f "$exported_fbx" ] || [ "$(stat -c %Y "$exported_fbx" 2>/dev/null || stat -f %m "$exported_fbx")" -lt "$started" ]; then
         echo "ERROR: did not produce expected FBX at '$exported_fbx'" >&2
         return 1
     fi

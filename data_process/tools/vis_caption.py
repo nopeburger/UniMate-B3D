@@ -60,7 +60,7 @@ from data_process.utils.motion_features import (  # noqa: E402
     PREVIEW_DPI, PREVIEW_FIGSIZE)
 from data_process.utils.plotting import render_skeleton_motion_ground  # noqa: E402
 
-DATASETS = ('truebones', 'mixamo', 'objaverse')
+DATASETS = ('truebones', 'mixamo', 'objaverse', 'general')
 MAX_RENDER_FRAMES = 200     # keep in sync with blender_render.MAX_RENDER_FRAMES
 DEFAULT_MAX_FRAMES = 1000   # render cost is linear in frames; 1000 cuts almost nothing
 

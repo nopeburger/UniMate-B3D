@@ -2,7 +2,9 @@
 
 Topology-agnostic helpers that operate on ``Animation`` objects: BFS joint
 reordering, geometric measurements, uniform scaling, root alignment,
-facing-axis alignment and motion activity metrics.
+facing-axis alignment and motion activity metrics; plus rest-skeleton fitting
+(similarity fit, collinearity, bone-axis alignment between two rigs of one
+skeleton) on plain arrays.
 
 Naming conventions:
     get_*    — pure computations that return a value (no mutation).
@@ -15,6 +17,7 @@ import statistics
 from collections import deque
 
 import numpy as np
+from loguru import logger
 from Quaternions import Quaternions
 from Animation import Animation, positions_global, offset_lengths
 
@@ -287,6 +290,20 @@ def align_root_to_ground(anim, ground_height=None):
 # Root orientation alignment (facing axis)
 # ---------------------------------------------------------------------------
 
+class DegenerateSkeletonError(ValueError):
+    """Raised when a T-pose cannot be canonicalized (e.g. zero-length bones,
+    a face pair without horizontal separation).
+
+    Callers treat this as a skip-with-reason for the whole object type rather
+    than a hard failure.
+    """
+
+
+# Smallest horizontal component of the unit face-pair vector that still
+# defines a facing direction.
+FACING_EPS = 1e-6
+
+
 def _normalize(v, eps=1e-8):
     """Return ``v`` normalized along its last axis with a numerical floor."""
     norm = np.sqrt((v ** 2).sum(axis=-1, keepdims=True))
@@ -323,6 +340,9 @@ def get_root_facing_quat(joints, face_joint_idxs, body_axis=False):
 
     Returns:
         Quaternions of shape (F,) aligning the skeleton to face Z+.
+
+    Raises:
+        DegenerateSkeletonError: no frame's pair has horizontal separation.
     """
     if face_joint_idxs is None or (
         len(face_joint_idxs) >= 2
@@ -345,7 +365,24 @@ def get_root_facing_quat(joints, face_joint_idxs, body_axis=False):
         )
 
     across = _normalize(across)
-    forward = _normalize(np.cross(np.array([[0, 1, 0]]), across, axis=-1))
+    forward = np.cross(np.array([[0, 1, 0]]), across, axis=-1)
+    # A pair with no horizontal separation (coincident or vertical joints)
+    # has no facing: such a frame takes the nearest valid frame's, and a
+    # sequence without any valid frame (e.g. the single T-pose frame) cannot
+    # be aligned at all.
+    valid = np.sqrt((forward ** 2).sum(axis=-1)) > FACING_EPS
+    if not valid.all():
+        if not valid.any():
+            raise DegenerateSkeletonError(
+                f"face joints {list(face_joint_idxs)} have no horizontal "
+                f"separation; the facing direction is undefined")
+        good = np.flatnonzero(valid)
+        frames = np.arange(len(forward))
+        after = good[np.minimum(np.searchsorted(good, frames), len(good) - 1)]
+        before = good[np.maximum(np.searchsorted(good, frames, side='right') - 1, 0)]
+        nearest = np.where(np.abs(frames - before) <= np.abs(after - frames), before, after)
+        forward = forward[nearest]
+    forward = _normalize(forward)
 
     if body_axis:
         rot_correction = Quaternions.from_euler(np.array([0, -np.pi / 2, 0]), "xyz")
@@ -353,6 +390,11 @@ def get_root_facing_quat(joints, face_joint_idxs, body_axis=False):
 
     target = np.array([[0, 0, 1]]).repeat(len(forward), axis=0)
     root_quat = Quaternions.between(forward, target)
+    # ``between`` degenerates to the zero quaternion when forward is exactly -Z
+    # (antiparallel to the target); the rotation there is a half turn about Y.
+    flipped = (forward * target).sum(axis=-1) < -1.0 + 1e-9
+    if flipped.any():
+        root_quat.qs[flipped] = np.array([0.0, 0.0, 1.0, 0.0])
 
     return root_quat
 
@@ -531,3 +573,108 @@ def get_motion_activity_metrics(positions, top_k_ratio=0.25, top_k_min=2):
         "joint_activity_topk": joint_activity_topk,
         "root_activity": root_activity,
     }
+
+
+# ---------------------------------------------------------------------------
+# Rest-skeleton fitting (plain arrays)
+# ---------------------------------------------------------------------------
+
+def line_ratio(points):
+    """Second over first singular value of the centred *points*: 0 when they
+    lie on one line, where a rotation about that line cannot be measured."""
+    points = np.asarray(points, dtype=np.float64)
+    sv = np.linalg.svd(points - points.mean(0), compute_uv=False)
+    return float(sv[1] / max(sv[0], 1e-12)) if len(sv) > 1 else 0.0
+
+
+def similarity_fit(X, Y):
+    """Least-squares similarity ``Y ~= s R X + t`` between matched point sets
+    (Umeyama, no reflection). Returns ``(R, s, t, residual)``, the residual
+    being the largest point error over the extent of *Y*."""
+    X = np.asarray(X, dtype=np.float64)
+    Y = np.asarray(Y, dtype=np.float64)
+    mx, my = X.mean(0), Y.mean(0)
+    Xc, Yc = X - mx, Y - my
+    U, S, Vt = np.linalg.svd(Yc.T @ Xc)
+    D = np.eye(3)
+    D[2, 2] = np.sign(np.linalg.det(U @ Vt))
+    R = U @ D @ Vt
+    s = float((S * D.diagonal()).sum() / max((Xc ** 2).sum(), 1e-30))
+    t = my - s * R @ mx
+    extent = max(float(np.ptp(Y, axis=0).max()), 1e-12)
+    residual = float(np.abs(s * Xc @ R.T + my - Y).max()) / extent
+    return R, s, t, residual
+
+
+def motion_axis_alignment(motion_rest_global, motion_names, rig_rest_global, rig_names,
+                          conj_rot=None, rel_tol=5e-3, min_angle_deg=0.01,
+                          min_line_ratio=5e-2, min_coverage=0.8):
+    """Per-bone rotation from a motion's bone axes to a rig's, or None.
+
+    Keys are ``rest⁻¹ @ anim`` in each bone's own axes, so they replay
+    correctly only on a rig whose bones have the motion's axes. One skeleton
+    can be given different axes by different importers (Blender's glTF
+    importer orients bones by a heuristic that changed between versions), and
+    replaying a clip made with one onto an import made with the other plays
+    it rotated and drifting. When the two rest skeletons are the same up to a
+    similarity (at least *min_coverage* of the motion's joints found in the
+    rig by name, joint positions within *rel_tol* of the extent; a different
+    character of the same rig family is well outside it), each motion bone
+    gets ``C_j = E_jᵀ Rᵀ T_j`` (*E*: its rest
+    rotation in the motion's world frame, times *conj_rot* when given; *T*:
+    the rig bone's rest rotation; *R*: the similarity's rotation), and
+    conjugating the bone's keys by it plays the motion's world-space change
+    from rest on the rig's own axes (exactly when the two skeletons have one
+    scale; location keys are not rescaled). A skeleton whose joints lie
+    (nearly) on one line is left alone: its roll about the line cannot be
+    measured, and a fitted one would twist the motion.
+
+    Args:
+        motion_rest_global: ``(J, 4, 4)`` rest transforms of the motion (FK).
+        motion_names: its ``J`` bone names.
+        rig_rest_global: ``(N, 4, 4)`` armature-space rest matrices of the rig.
+        rig_names: its ``N`` bone names.
+        conj_rot: optional ``(J, 3, 3)`` rotations the keys are already
+            conjugated by (the T-pose frames of the ``.npy`` path).
+
+    Returns:
+        ``(J, 3, 3)`` rotations to conjugate the keys by (*conj_rot* composed
+        with the alignment; *conj_rot* alone, or identity, for bones the rig
+        lacks), or None when the skeletons differ (another character: the
+        local keys are the retargeting rule), cannot be fitted, or the axes
+        already agree.
+    """
+    rig_index = {str(n): i for i, n in enumerate(rig_names)}
+    common = [j for j, n in enumerate(motion_names) if str(n) in rig_index]
+    if len(common) < max(3, min_coverage * len(motion_names)):
+        return None
+    X = motion_rest_global[common, :3, 3]
+    Y = rig_rest_global[[rig_index[str(motion_names[j])] for j in common], :3, 3]
+    R, s, _t, residual = similarity_fit(X, Y)
+    if residual > rel_tol:
+        return None
+    E = motion_rest_global[:, :3, :3].copy()
+    E /= np.linalg.norm(E, axis=1, keepdims=True)
+    if conj_rot is not None:
+        E = E @ conj_rot
+    C = np.broadcast_to(np.eye(3), E.shape).copy()
+    for j in common:
+        T = rig_rest_global[rig_index[str(motion_names[j])], :3, :3]
+        T = T / np.linalg.norm(T, axis=0, keepdims=True)
+        C[j] = E[j].T @ R.T @ T
+    angles = np.degrees(np.arccos(np.clip((np.trace(C, axis1=1, axis2=2) - 1) / 2, -1, 1)))
+    if angles.max() < min_angle_deg:
+        return None
+    if line_ratio(X) < min_line_ratio:
+        logger.warning("Rig bone axes may differ from the motion's, but the joints lie "
+                       "(nearly) on one line, so the difference cannot be measured; keys "
+                       "replayed unchanged")
+        return None
+    changed = [str(motion_names[j]) for j in common if angles[j] >= min_angle_deg]
+    logger.info(f"Rig bone axes differ from the motion's on {len(changed)} bone(s) "
+                f"({changed[:4]}{'...' if len(changed) > 4 else ''}): keys re-expressed "
+                f"in the rig's axes (rest skeletons agree within {residual:.1e})")
+    if abs(s - 1) > rel_tol:
+        logger.warning(f"The rig's rest skeleton is {s:.4g}x the motion's: location keys "
+                       f"are not rescaled")
+    return C if conj_rot is None else conj_rot @ C

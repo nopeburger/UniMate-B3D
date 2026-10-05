@@ -26,7 +26,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
 handle_help "$@"
 
-DATASET=${1:?Usage: run_joints_vis_facing.sh <truebones|mixamo|objaverse>}
+DATASET=${1:?Usage: run_joints_vis_facing.sh <truebones|mixamo|objaverse|general>}
 require_dataset "$DATASET"
 EXPORT_DIR=$(export_dir "$DATASET")
 [[ -d "$EXPORT_DIR/motions" ]] || { echo "export motions not found: $EXPORT_DIR/motions" >&2; exit 1; }

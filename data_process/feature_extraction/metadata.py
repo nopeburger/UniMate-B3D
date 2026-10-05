@@ -77,6 +77,47 @@ def load_motion_captions(source_dir):
     return load_json(pjoin(source_dir, 'motion_captions.json'))
 
 
+# Extra caption versions beside the normal one (``motion_captions.json`` ->
+# ``captions.json``): the short generic caption and the longer detail caption,
+# HumanML3D-style. Each comes only from its reviewed patch file through
+# ``patch_annotations.py`` (export ``motion_captions_<v>.json``) and is saved by
+# stage 4 as ``captions_<v>.json``; training may sample one per step.
+EXTRA_CAPTION_VERSIONS = ('generic', 'detail')
+
+
+def load_extra_captions(source_dir, version):
+    # type: (str, str) -> Optional[Dict[str, str]]
+    """Load one extra caption version from ``motion_captions_<version>.json``
+    (written by ``patch_annotations.py``; None when the export has none)."""
+    if version not in EXTRA_CAPTION_VERSIONS:
+        raise ValueError(f'unknown caption version {version!r}; '
+                         f'expected one of {EXTRA_CAPTION_VERSIONS}')
+    return load_json(pjoin(source_dir, f'motion_captions_{version}.json'))
+
+
+def load_generic_captions(source_dir):
+    # type: (str) -> Optional[Dict[str, str]]
+    """``load_extra_captions(source_dir, 'generic')``."""
+    return load_extra_captions(source_dir, 'generic')
+
+
+def by_feature_key(feature_captions, export_captions):
+    # type: (Dict[str, str], Dict[str, str]) -> Dict[str, str]
+    """Re-key an export ``{clip: caption}`` map (normal, generic or detail) by
+    the feature clip keys.
+
+    Feature keys are ``<export clip>-<NNN>`` (one per saved segment), the keys
+    of ``captions.json``; every segment of a clip gets the clip's caption.
+    Feature clips without an export caption are left out.
+    """
+    out = {}
+    for key in feature_captions:
+        stem = key.rsplit('-', 1)[0]
+        if stem in export_captions:
+            out[key] = export_captions[stem]
+    return out
+
+
 def load_category_groups(source_dir):
     # type: (str) -> Optional[Dict[str, List[str]]]
     """Load category-to-object-type groupings from ``category_groups.json``."""
@@ -227,8 +268,37 @@ def collect_captions(cond):
     return all_captions
 
 
-def save_outputs(save_dir, cond, all_filtered_clips, category_groups=None):
+def save_extra_captions(save_dir, all_captions, version, export_captions):
+    """Write ``captions_<version>.json`` (keyed like ``captions.json``) from
+    the export's ``motion_captions_<version>.json`` map, or remove a stale
+    one when no saved clip has a caption of that version. Returns the dict
+    written (empty when none)."""
+    path = pjoin(save_dir, f'captions_{version}.json')
+    out = (by_feature_key(all_captions, export_captions)
+           if all_captions and export_captions else {})
+    if out:
+        save_json(path, out)
+        missing = sorted(set(all_captions) - set(out))
+        print(f'Saved {len(out)}/{len(all_captions)} {version} clip captions'
+              + (f'; {len(missing)} saved clips have none, e.g. {missing[:3]}' if missing else ''))
+    elif os.path.isfile(path):
+        os.remove(path)
+        print(f'Removed stale {path} (no {version} captions this run)')
+    return out
+
+
+def save_outputs(save_dir, cond, all_filtered_clips, category_groups=None,
+                 extra_captions=None):
     """Save ``cond.npy``, filtered clips, captions, and category groupings.
+
+    Caption files, keyed alike by saved clip (``<clip>-<NNN>``):
+    ``captions.json`` from ``motion_captions.json`` (the normal caption; a
+    clip without one is not saved) and, for each version ``v`` of
+    ``EXTRA_CAPTION_VERSIONS``, ``captions_<v>.json`` from
+    ``extra_captions[v]`` (the export's ``motion_captions_<v>.json``). Extra
+    captions never enter ``cond`` or the ``cond_parts`` cache, so changing them
+    never re-processes an object; a version without captions has its stale
+    ``captions_<v>.json`` removed.
 
     Captions and category groups are only written when present. Every file is
     written atomically, so an interrupted run cannot leave a truncated output
@@ -246,6 +316,9 @@ def save_outputs(save_dir, cond, all_filtered_clips, category_groups=None):
     if all_captions:
         save_json(pjoin(save_dir, 'captions.json'), all_captions)
         print(f'Saved {len(all_captions)} clip captions')
+    for version in EXTRA_CAPTION_VERSIONS:
+        save_extra_captions(save_dir, all_captions, version,
+                            (extra_captions or {}).get(version))
 
     if category_groups:
         save_json(pjoin(save_dir, 'category_groups.json'), category_groups)
@@ -278,8 +351,12 @@ def save_metadata_report(save_dir, stats, all_filtered_clips,
     """Write a human-readable metadata summary to ``metadata.txt``.
 
     ``all_captions`` and ``category_groups`` are optional; their sections are
-    omitted when not supplied. The file is written atomically.
+    omitted when not supplied. The extra-caption counts are read back from
+    the ``captions_<v>.json`` files ``save_outputs`` wrote. The file is
+    written atomically.
     """
+    extra = {v: load_json(pjoin(save_dir, f'captions_{v}.json'))
+             for v in EXTRA_CAPTION_VERSIONS}
     total_filtered = sum(len(v) for v in all_filtered_clips.values())
 
     with atomic_output_path(pjoin(save_dir, 'metadata.txt')) as tmp_path, \
@@ -291,6 +368,9 @@ def save_metadata_report(save_dir, stats, all_filtered_clips,
         f.write(f'Max joints in dataset: {stats["max_njoints"]}\n')
         if all_captions is not None:
             f.write(f'Total captions: {len(all_captions)}\n')
+        for version, caps in extra.items():
+            if caps is not None:
+                f.write(f'Total {version} captions: {len(caps)}\n')
 
         f.write('Clips per object type:\n')
         for obj, count in stats['clips_per_object'].items():

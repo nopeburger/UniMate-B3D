@@ -66,6 +66,7 @@ class EMAModel:
         self.cur_decay_value = decay
         one_minus_decay = 1 - decay
 
+        _check_pairing(self.shadow_params, parameters)
         for s_param, param in zip(self.shadow_params, parameters):
             if param.dtype != s_param.dtype:
                 param = param.to(s_param.dtype)
@@ -78,6 +79,7 @@ class EMAModel:
     def copy_to(self, parameters: Iterator[torch.nn.Parameter]) -> None:
         """Copy shadow (averaged) params into *parameters*."""
         parameters = [p for p in parameters if p.requires_grad]
+        _check_pairing(self.shadow_params, parameters)
         for s_param, param in zip(self.shadow_params, parameters):
             param.data.copy_(s_param.data)
 
@@ -88,6 +90,7 @@ class EMAModel:
     def restore(self, parameters: Iterator[torch.nn.Parameter]) -> None:
         """Restore params saved by :meth:`store`."""
         parameters = [p for p in parameters if p.requires_grad]
+        _check_pairing(self.collected_params, parameters)
         for c_param, param in zip(self.collected_params, parameters):
             param.data.copy_(c_param.data)
 
@@ -116,3 +119,16 @@ class EMAModel:
     def to(self, device=None, dtype=None) -> None:
         """Move shadow params to the given device / dtype."""
         self.shadow_params = [p.to(device=device, dtype=dtype) for p in self.shadow_params]
+
+
+def _check_pairing(saved, parameters) -> None:
+    """Saved tensors pair with the model's trainable parameters by position;
+    a count or shape mismatch (another model, a changed parameter order) would
+    otherwise be truncated by ``zip`` or broadcast by ``copy_`` silently."""
+    if len(saved) != len(parameters):
+        raise ValueError(f"EMA holds {len(saved)} tensors for {len(parameters)} "
+                         f"trainable parameters")
+    for i, (a, b) in enumerate(zip(saved, parameters)):
+        if a.shape != b.shape:
+            raise ValueError(f"EMA tensor {i} has shape {tuple(a.shape)}, the "
+                             f"parameter {tuple(b.shape)}")

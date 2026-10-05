@@ -22,7 +22,8 @@ class TrainingTracker:
     Args:
         max_epochs: Stop after this many full passes through the dataset.
         max_steps: Stop after this many optimizer steps.
-        steps_per_epoch: Number of batches per epoch (``len(dataloader)``).
+        steps_per_epoch: Optimizer steps per epoch (this rank's batches over
+            the gradient accumulation).
             Used to estimate epochs from steps (or vice versa).
     """
 

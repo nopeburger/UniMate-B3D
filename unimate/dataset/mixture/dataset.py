@@ -50,7 +50,7 @@ logger = get_logger(file_name=__file__, debug="mixture_dataset")
 
 # Per-dataset train/eval split mode:
 #   - 'object_type' — hold out whole object types as eval. Default for
-#                     multi-topology datasets (truebones, objaverse): training
+#                     multi-topology datasets (truebones, objaverse, general): training
 #                     never sees the held-out skeletons, so eval measures
 #                     generalization to unseen topologies.
 #   - 'clip'        — stratified per-object-type at the clip level (train/eval
@@ -66,6 +66,7 @@ _DATASET_SPLIT_MODE = {
     'mixamo':    'clip',
     'truebones': 'object_type',
     'objaverse': 'object_type',
+    'general':   'object_type',
 }
 
 # The UniMate representation stores per-frame deltas (root trajectory and
@@ -189,6 +190,27 @@ def model_joint_names(cond_entry, object_type):
 # MotionDataset — stores all motion clips in memory
 # ---------------------------------------------------------------------------
 
+
+# Datasets normalized with another one's stats when a loaded per-dataset stats
+# file lacks them (``_check_loaded_stats``).
+STATS_FALLBACK = {'general': 'objaverse'}
+# add_cond_object: fewest joints a skeleton can have (a lone root leaves no
+# key for the final layer's attention), and how far from the origin (relative
+# to the T-pose extent) its T-pose root may sit.
+MIN_COND_JOINTS = 2
+ROOT_XZ_TOL = 1e-6
+
+
+def _check_new_clip_key(motion_dict, key, dataset_type):
+    """Clip keys share one namespace across datasets (Mixamo's are
+    ``mixamo_<clip>``, the others' the file stem); a key loaded twice would
+    silently replace the first clip."""
+    if key in motion_dict:
+        raise ValueError(
+            f"clip key {key!r} of {dataset_type} is already taken by "
+            f"{motion_dict[key].get('dataset_type', 'another dataset')}; rename the asset")
+
+
 class MotionDataset(data.Dataset):
     """In-memory dataset of motion clips across heterogeneous skeletons.
 
@@ -226,6 +248,8 @@ class MotionDataset(data.Dataset):
         target_object_types: Optional[Set[str]] = None,
         target_clip_stems: Optional[Set[str]] = None,
         stats_path: Optional[str] = None,
+        generic_caption_prob: float = 0.0,
+        detail_caption_prob: float = 0.0,
     ):
         self._init_config(
             topology_condition_type, max_motion_length, config_max_depth,
@@ -237,6 +261,11 @@ class MotionDataset(data.Dataset):
         self._target_object_types = target_object_types
         self._target_clip_stems = target_clip_stems
         self._stats_path = stats_path
+        self.generic_caption_prob = generic_caption_prob
+        self.detail_caption_prob = detail_caption_prob
+        # Extra caption versions this run samples -> probability, in draw order.
+        self.caption_probs = {v: p for v, p in (('generic', generic_caption_prob),
+                                                ('detail', detail_caption_prob)) if p > 0}
         self._init_data_state(data_dict)
         if self._target_object_types is not None:
             # Sampling uses both train and eval maps; honoring test_objects.txt
@@ -304,6 +333,11 @@ class MotionDataset(data.Dataset):
         """Initialize per-dataset state derived from ``data_dict``."""
         self.dataset_stats = {}
         self.cond_dict = {}
+        # Object types registered from a cond entry alone (add_cond_object),
+        # and the clips each was given there (ground truth for in-betweening /
+        # motion editing; empty for a skeleton-only asset).
+        self.cond_only_object_types = set()
+        self.cond_object_clips = {}
         self.dataset_object_count = {}
         self.split_mode_by_dataset = dict(_DATASET_SPLIT_MODE)
         # ``explicit_eval_objects[dt]`` (from ``test_objects.txt``) overrides
@@ -324,6 +358,9 @@ class MotionDataset(data.Dataset):
         """
         self._encoder_spec = (text_encoder_type, text_encoder_version)
         self.text_encoder = None
+        # Whether self.text_encoder was built here (and so is freed here): a
+        # caller may lend its own encoder for add_cond_object.
+        self._owns_text_encoder = False
         roots = [info.get('root_dir') for info in data_dict.values()]
         # Joint names are shared vocabulary — the same string encodes
         # identically everywhere, so merging them by name across datasets is
@@ -333,24 +370,40 @@ class MotionDataset(data.Dataset):
         # rather than merely unlikely.
         joint_cache = load_caches(roots, 'joint', text_encoder_type,
                                   text_encoder_version)
-        text_cache = {
-            (ds_type, clip): tokens
-            for ds_type, info in data_dict.items()
-            for clip, tokens in load_cache(info.get('root_dir'), 'caption',
-                                           text_encoder_type,
-                                           text_encoder_version).items()
-        }
         self._preencode_joint_names(data_dict, joint_cache)
-        self._preencode_captions(data_dict, text_cache)
+        # Normal captions (captions.json) and, when a run samples them, the
+        # extra versions (captions_generic.json, captions_detail.json): same
+        # keys, separate caches. Passing the texts drops any cached entry
+        # built from an older caption, so it is re-encoded instead of
+        # silently reused.
+        self._caption_tokens, self._caption_emb = self._preencode_captions(
+            data_dict, 'captions', 'caption', 'captions')
+        self._extra_caption_tokens, self._extra_caption_emb = {}, {}
+        self._extra_captions = {}
+        for v, p in self.caption_probs.items():
+            self._extra_caption_tokens[v], self._extra_caption_emb[v] = (
+                self._preencode_captions(data_dict, f'captions_{v}',
+                                         f'caption_{v}', f'{v} captions'))
+            self._extra_captions[v] = {
+                (ds_type, clip): cap
+                for ds_type, info in data_dict.items()
+                for clip, cap in info.get(f'captions_{v}', {}).items()
+            }
+            logger.info(
+                f'{v.capitalize()} captions for {len(self._extra_caption_emb[v])}/'
+                f'{len(self._caption_emb)} captioned clips; each sample uses '
+                f'one with p={p}')
         if self.text_encoder is not None:
             del self.text_encoder
             self.text_encoder = None
+            self._owns_text_encoder = False
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
     def _ensure_text_encoder(self):
         """Build the text encoder on first use (i.e. on the first cache miss)."""
         if self.text_encoder is None:
+            self._owns_text_encoder = True
             encoder_type, encoder_version = self._encoder_spec
             logger.info(f'Text cache incomplete; loading {encoder_type} encoder')
             self.text_encoder = create_text_encoder(
@@ -371,6 +424,7 @@ class MotionDataset(data.Dataset):
             'truebones': self._load_multi_topology,
             'mixamo':    self._load_single_topology,
             'objaverse': self._load_multi_topology,
+            'general':   self._load_multi_topology,
         }
         for dataset_type, dataset_info in data_dict.items():
             loader = loaders.get(dataset_type)
@@ -491,37 +545,43 @@ class MotionDataset(data.Dataset):
                 all_names, 'joint names', cache=cache).items()
         }
 
-    def _preencode_captions(self, data_dict, cache=None):
-        """Encode each clip's caption → ``self._caption_tokens`` (+ pooled).
+    def _preencode_captions(self, data_dict, field, cache_kind, label):
+        """Encode each clip's ``data_dict[ds][field]`` caption.
 
-        Skipped when ``target_object_types`` is set: captions come from the
-        per-test-case spec and are encoded inline at sample time.
+        Returns ``(tokens, pooled)`` dicts keyed by ``(dataset_type, clip)``.
+        Skipped (empty dicts) when ``target_object_types`` is set: captions
+        come from the per-test-case spec and are encoded inline at sample time.
         """
         if self._target_object_types is not None:
-            self._caption_emb = {}
-            self._caption_tokens = {}
-            logger.info('Skipping caption pre-encoding (inference mode).')
-            return
+            logger.info(f'Skipping {label} pre-encoding (inference mode).')
+            return {}, {}
         caption_by_clip = {
             (ds_type, clip): cap
             for ds_type, dataset_info in data_dict.items()
-            for clip, cap in dataset_info.get('captions', {}).items()
+            for clip, cap in dataset_info.get(field, {}).items()
             if cap
+        }
+        enc_type, enc_version = self._encoder_spec
+        cache = {
+            (ds_type, clip): tokens
+            for ds_type, info in data_dict.items()
+            for clip, tokens in load_cache(
+                info.get('root_dir'), cache_kind, enc_type, enc_version,
+                texts=info.get(field, {})).items()
         }
         # Keyed by (dataset_type, clip): a clip's
         # features are one lookup, with no caption-string round trip. Repeated
         # captions are still encoded once — _batch_encode_unique dedupes the
         # strings before the forward pass.
-        cache = cache or {}
         todo = {k: c for k, c in caption_by_clip.items() if k not in cache}
-        by_text = self._batch_encode_unique(list(todo.values()), 'captions')
+        by_text = self._batch_encode_unique(list(todo.values()), label)
 
         # A cache hit carries both views: the token sequence text_cond=
         # 'cross_attn' attends, and the pooled vector text_cond='adaln' reads
         # — the latter exactly as the encoder produced it, so adaLN gets the
         # same number the pooled encoder always returned. Only a cache MISS
         # falls back to pooling the sequence here.
-        self._caption_tokens, self._caption_emb = {}, {}
+        tokens_by_key, pooled_by_key = {}, {}
         for k in caption_by_clip:
             if k in cache:
                 tokens, pooled = cache[k]
@@ -530,8 +590,9 @@ class MotionDataset(data.Dataset):
                 if tokens is None:
                     continue
                 pooled = pool_tokens(tokens)
-            self._caption_tokens[k] = tokens
-            self._caption_emb[k] = pooled
+            tokens_by_key[k] = tokens
+            pooled_by_key[k] = pooled
+        return tokens_by_key, pooled_by_key
 
     def _precompute_object_type_meta(self, object_type, cond_entry):
         """Per-object-type meta reused across all clips of that type."""
@@ -624,14 +685,18 @@ class MotionDataset(data.Dataset):
         if cap_key in self._caption_emb:
             entry['caption_emb'] = self._caption_emb[cap_key]        # (D,)
             entry['caption_tokens'] = self._caption_tokens[cap_key]  # (T, D)
+        for v, emb in self._extra_caption_emb.items():
+            if cap_key in emb:
+                entry[f'caption_{v}'] = self._extra_captions[v][cap_key]
+                entry[f'caption_{v}_emb'] = emb[cap_key]
+                entry[f'caption_{v}_tokens'] = self._extra_caption_tokens[v][cap_key]
         return entry
 
     def _check_clip_fps(self, motion_dir, motion_name, npz):
         """Reject clips whose frame rate is not the one the features assume.
 
-        Pre-``fps`` feature sets predate the field; they were all built at 30
-        fps, so a missing field is accepted with one warning per directory
-        rather than failing the run.
+        A clip without an ``fps`` field is taken as 30 fps, with one warning
+        per directory, rather than failing the run.
         """
         if 'fps' not in npz:
             if motion_dir not in self._fps_unset_dirs:
@@ -657,9 +722,158 @@ class MotionDataset(data.Dataset):
             f'across {n_types} object type{"s" if n_types != 1 else ""}'
         )
 
+    def _check_object_type_unique(self, object_type, dataset_type):
+        """Object types and clip names key one shared namespace across datasets
+        (``cond_dict``, ``motion_dict``), so a name two datasets share would
+        silently replace one skeleton with the other. Only the ``general``
+        dataset (assets named by their file stem) can realistically hit this."""
+        for other, counts in self.dataset_object_count.items():
+            if other != dataset_type and object_type in counts:
+                raise ValueError(
+                    f"Object type {object_type!r} exists in both {other!r} and "
+                    f"{dataset_type!r}; rename the asset (object types must be "
+                    f"unique across dataset_list).")
+
+    # ------------------------------------------------------------------
+    # Assets given by their cond entry alone (inference)
+    # ------------------------------------------------------------------
+
+    def resolve_stats_key(self, dataset_type):
+        """The ``dataset_stats`` key that normalizes an asset of *dataset_type*:
+        itself, its ``STATS_FALLBACK``, or (one global pool) any key."""
+        stats = self.dataset_stats
+        if not stats:
+            raise ValueError("No normalization stats loaded; sampling an asset from a "
+                             "cond entry needs the run's dataset_stats.npy.")
+        if dataset_type in stats:
+            return dataset_type
+        like = STATS_FALLBACK.get(dataset_type)
+        if like in stats:
+            return like
+        entries = list(stats.values())
+        arrays = ('mean_root', 'std_root', 'mean_local', 'std_local')
+        if all(all(np.array_equal(e[k], entries[0][k]) for k in arrays) for e in entries):
+            return next(iter(stats))
+        raise ValueError(f"No normalization stats for {dataset_type!r}; the run has "
+                         f"per-dataset stats for {sorted(stats)}.")
+
+    def merge_joint_name_cache(self, root_dirs):
+        """Add the joint-name embeddings cached in these feature directories
+        (``unimate/tools/precompute_text_emb.py``) to the ones already encoded,
+        so :meth:`add_cond_object` encodes only names none of them holds."""
+        enc_type, enc_version = self._encoder_spec
+        cached = load_caches([d for d in root_dirs if d], 'joint', enc_type, enc_version)
+        for name, emb in cached.items():
+            if name not in self._joint_name_emb:
+                self._joint_name_emb[name] = emb if emb.ndim == 1 else pool_tokens(emb)
+
+    def add_cond_object(self, object_type, cond_entry, dataset_type, motion_dir=None,
+                        clip_files=(), clip_key_prefix=''):
+        """Register an object type from its stage-4 cond entry, for sampling.
+
+        The skeleton is taken from *cond_entry* (an entry of a feature
+        directory's ``cond.npy``, or of ``data_process.rig_preprocess``'s); the
+        motion features are normalized with the stats of *dataset_type*
+        (see :meth:`resolve_stats_key`). It always gets one reference clip,
+        its rest pose (``<object_type>-rest_pose.npz``), which supplies the
+        skeleton to ``create_sample_condition`` like any clip and is no ground
+        truth. *clip_files* (file names in *motion_dir*, stage-4 feature NPZs
+        of this skeleton) are loaded as its real clips, keyed
+        ``<clip_key_prefix><file>``: the ground truth in-betweening and
+        motion editing hold. Returns the stats key used.
+        """
+        if object_type in self.cond_dict:
+            raise ValueError(f"Object type {object_type!r} is already loaded.")
+        if '-' in object_type:
+            raise ValueError(f"Object type {object_type!r} must not contain '-'.")
+        n_joints = len(cond_entry['parents'])
+        if n_joints > self.max_joints:
+            raise ValueError(
+                f"{object_type!r} has {n_joints} joints; the model is padded to "
+                f"max_joints={self.max_joints}.")
+        if n_joints < MIN_COND_JOINTS:
+            raise ValueError(f"{object_type!r} has {n_joints} joint(s); a skeleton needs "
+                             f"at least {MIN_COND_JOINTS}.")
+        tpos = np.asarray(cond_entry['tpos_first_frame'], dtype=np.float64)
+        extent = float(np.ptp(tpos, axis=0).max()) or 1.0
+        root_xz = float(np.abs(tpos[0, [0, 2]]).max())
+        if root_xz > ROOT_XZ_TOL * extent:
+            # The root stats of the X / Z channels sit at the std floor
+            # (every training T-pose has its root at the origin), so an
+            # off-centre root would reach the model hugely amplified.
+            raise ValueError(
+                f"{object_type!r}: the T-pose root is at XZ "
+                f"{tpos[0, [0, 2]].round(6).tolist()}, not the origin: not a stage-4 "
+                f"(canonical) cond entry.")
+        depth = int(np.max(cond_entry['joint_depths']))
+        if depth > self.max_depth:
+            logger.warning(f"{object_type!r}: joint depth {depth} exceeds the model's "
+                           f"max_depth={self.max_depth}; deeper joints share its embedding.")
+        stats_key = self.resolve_stats_key(dataset_type)
+        if root_xz > 0:
+            cond_entry = dict(cond_entry)
+            cond_entry['tpos_first_frame'] = tpos.copy()
+            cond_entry['tpos_first_frame'][0, [0, 2]] = 0.0
+
+        names = [n for n in model_joint_names(cond_entry, object_type)
+                 if n not in self._joint_name_emb]
+        if names:
+            encoded = self._batch_encode_unique(names, f'{object_type} joint names')
+            self._joint_name_emb.update(
+                {n: e if e.ndim == 1 else pool_tokens(e) for n, e in encoded.items()})
+            if self.text_encoder is not None and self._owns_text_encoder:
+                del self.text_encoder
+                self.text_encoder = None
+                self._owns_text_encoder = False
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        meta = self._precompute_object_type_meta(object_type, cond_entry)
+
+        # The rest pose as a two-frame still clip: T-pose positions, T-pose
+        # local rotations (identity after the rebase), canonical facing.
+        parents = meta['condition']['parents']
+        positions = np.repeat(meta['condition']['tpos'][None], 2, axis=0)
+        local_rotations = np.repeat(meta['tpos_local_rotations'][None], 2, axis=0)
+        rebased = compute_rots_from_tpos(
+            Quaternions(local_rotations.copy()), Quaternions(local_rotations), parents)
+        facing = Quaternions(np.tile([1.0, 0.0, 0.0, 0.0], (2, 1)))
+        motion_feats = compute_unimate_motion_feats(positions, rebased, parents, facing)
+        valid, reason = _validate_motion(motion_feats, parents=parents,
+                                         offsets=meta['offsets'],
+                                         gt_global_positions=positions)
+        if not valid:
+            raise ValueError(f"{object_type!r}: rest-pose features invalid ({reason}).")
+
+        entry = {'motion': motion_feats, 'offsets': meta['offsets'],
+                 'object_type': object_type, 'joint_names_emb': meta['joint_names_emb'],
+                 'dataset_type': stats_key, 'caption': ''}
+        entry.update(meta['condition'])
+        rest_clip = f'{object_type}-rest_pose.npz'
+        _check_new_clip_key(self.train_motion_dict, rest_clip, dataset_type)
+        clips = {}
+        for fname in clip_files:
+            key = f'{clip_key_prefix}{fname}'
+            clip = self._load_motion_file(motion_dir, fname, stats_key, meta, {})
+            if clip is None:
+                continue
+            _check_new_clip_key(self.train_motion_dict, key, dataset_type)
+            clips[key] = clip
+        self.cond_dict[object_type] = cond_entry
+        self.cond_only_object_types.add(object_type)
+        self.cond_object_clips[object_type] = sorted(clips)
+        self.train_motion_dict[rest_clip] = entry
+        self.train_motion_dict.update(clips)
+        self.train_object_motions_map[object_type] = [rest_clip] + sorted(clips)
+        self.selected_object_types = sorted(set(self.selected_object_types) | {object_type})
+        logger.info(f"Registered {object_type!r} from its cond entry ({n_joints} joints, "
+                    f"{dataset_type!r} -> stats {stats_key!r}"
+                    + (f", {len(clips)}/{len(clip_files)} clip(s)" if clip_files else '')
+                    + ").")
+        return stats_key
+
     def _load_multi_topology(self, dataset_info, dataset_type, motion_dict,
                              selected_object_types, name_list):
-        """Loader for multi-topology datasets (truebones, objaverse)."""
+        """Loader for multi-topology datasets (truebones, objaverse, general)."""
         cond_dict = dataset_info['cond_dict']
         motion_dir = dataset_info['motion_dir']
         captions = dataset_info.get('captions', {})
@@ -711,6 +925,7 @@ class MotionDataset(data.Dataset):
                 # create_sample_condition picks one at random anyway.
                 object_motions = object_motions[:3]
 
+            self._check_object_type_unique(object_type, dataset_type)
             self.cond_dict[object_type] = cond_dict[object_type]
             meta = self._precompute_object_type_meta(
                 object_type, cond_dict[object_type],
@@ -724,6 +939,7 @@ class MotionDataset(data.Dataset):
                 )
                 if entry is None:
                     continue
+                _check_new_clip_key(motion_dict, motion_name, dataset_type)
                 motion_dict[motion_name] = entry
                 selected_object_types.add(object_type)
                 name_list.append(motion_name)
@@ -795,6 +1011,7 @@ class MotionDataset(data.Dataset):
 
         # Register only after confirming clips exist, so empty types don't
         # leak into ``self.cond_dict`` / ``_compute_max_joints_and_depth``.
+        self._check_object_type_unique(object_type, dataset_type)
         self.cond_dict[object_type] = cond_data
         meta = self._precompute_object_type_meta(object_type, cond_data)
 
@@ -809,6 +1026,7 @@ class MotionDataset(data.Dataset):
             if entry is None:
                 continue
             prefixed_name = f'{object_type}_{motion_name}'
+            _check_new_clip_key(motion_dict, prefixed_name, dataset_type)
             motion_dict[prefixed_name] = entry
             selected_object_types.add(object_type)
             name_list.append(prefixed_name)
@@ -906,9 +1124,21 @@ class MotionDataset(data.Dataset):
             'mean': mean,
             'std': std,
         }
-        results['caption'] = data['caption']
-        results['caption_emb'] = data['caption_emb']
-        results['caption_tokens'] = data['caption_tokens']
+        # Up to three captions per clip: version v with probability
+        # caption_probs[v], else the normal one; a clip without the drawn
+        # version keeps its normal caption.
+        key = 'caption'
+        if self.caption_probs:
+            u, acc = random.random(), 0.0
+            for v, p in self.caption_probs.items():
+                acc += p
+                if u < acc:
+                    if f'caption_{v}_emb' in data:
+                        key = f'caption_{v}'
+                    break
+        results['caption'] = data[key]
+        results['caption_emb'] = data[f'{key}_emb']
+        results['caption_tokens'] = data[f'{key}_tokens']
 
         return results
 
@@ -999,9 +1229,11 @@ class MotionDataset(data.Dataset):
                         f'max_depths={max_depths_by_dataset[dt]}')
         logger.info(f'Data max_joints={data_max_joints} | max_depths={data_max_depths}')
 
-        # Headroom: joint-addition aug can add 1 joint.
+        # Headroom: joint-addition aug inserts 1 joint between a joint and its
+        # parent, which also pushes that joint's subtree one level deeper.
         if self.use_addition_aug:
             data_max_joints += 1
+            data_max_depths += 1
 
         if self.config_max_depth > 0 and data_max_depths > self.config_max_depth:
             logger.info(f'Clamping max_depths from {data_max_depths} to {self.config_max_depth}')
@@ -1178,6 +1410,7 @@ class MotionDataset(data.Dataset):
         if self._stats_path is not None:
             logger.info(f"Loading saved dataset stats from {self._stats_path}")
             self.dataset_stats = np.load(self._stats_path, allow_pickle=True).item()
+            self._check_loaded_stats()
             return
 
         mode = "object-type balanced" if self.balanced_stats else "frame-weighted"
@@ -1211,9 +1444,15 @@ class MotionDataset(data.Dataset):
 
             assert np.all(std_root > 0) and np.all(std_local > 0)
 
+            # ``pool`` and the two flags record how the arrays were made, so a
+            # run that loads this file can tell a global pool from a
+            # per-dataset one (see ``_check_loaded_stats``).
             stats = {
                 'mean_root':  mean_root,  'std_root':  std_root,
                 'mean_local': mean_local, 'std_local': std_local,
+                'pool': label,
+                'balanced_stats': bool(self.balanced_stats),
+                'tie_std': bool(self.tie_std),
             }
             # Global mode broadcasts the single result across all dataset_type
             # keys so downstream lookups remain uniform.
@@ -1233,6 +1472,93 @@ class MotionDataset(data.Dataset):
                 )
 
         logger.info("Dataset statistics calculation finished.")
+
+    def _check_loaded_stats(self):
+        """Validate stats loaded from disk and reconcile them with the
+        datasets loaded now.
+
+        Each entry records its ``pool`` (``'<all>'`` for the global pool, else
+        its dataset type). A single entry is one pool either way, so it counts
+        as global when tagged ``'<all>'`` or when the config sets
+        ``use_dataset_stats=false``. In an untagged file, identical entries
+        count as global and differing ones as per-dataset. A global file is applied to dataset types it has
+        no key for (a fine-tune that adds a dataset normalizes it like the
+        rest); a per-dataset file missing a dataset that has clips raises here
+        rather than as a ``KeyError`` mid-training.
+        """
+        path = self._stats_path
+        stats = self.dataset_stats
+        arrays = ('mean_root', 'std_root', 'mean_local', 'std_local')
+        if not isinstance(stats, dict) or not stats:
+            raise ValueError(f"{path} holds no normalization stats.")
+        for d, e in stats.items():
+            if not isinstance(e, dict) or any(k not in e for k in arrays):
+                raise ValueError(f"{path}: entry {d!r} lacks one of {arrays}.")
+            bad = [k for k in arrays if np.shape(e[k]) != (self.feature_len,)]
+            if bad:
+                raise ValueError(
+                    f"{path}: entry {d!r} has {bad} of shape "
+                    f"{np.shape(e[bad[0]])}, expected ({self.feature_len},)."
+                )
+
+        entries = list(stats.values())
+        if len(entries) == 1:
+            is_global = (entries[0].get('pool') == '<all>'
+                         or not self.use_dataset_stats)
+        elif all('pool' in e for e in entries):
+            is_global = all(e['pool'] == '<all>' for e in entries)
+        else:
+            is_global = all(
+                all(np.array_equal(e[k], entries[0][k]) for k in arrays)
+                for e in entries[1:]
+            )
+
+        if not self.use_dataset_stats and not is_global:
+            raise ValueError(
+                f"{path} holds per-dataset stats ({sorted(stats)}), but the "
+                f"config sets use_dataset_stats=false."
+            )
+        # The file wins over the config; adopting its settings lets
+        # create_dataset write them back, so the run's config.json describes
+        # the normalization it actually used.
+        if self.use_dataset_stats and is_global:
+            logger.warning(
+                f"{path} holds one global stats pool, but the config sets "
+                f"use_dataset_stats=true; using the file's global pool."
+            )
+            self.use_dataset_stats = False
+        for flag in ('balanced_stats', 'tie_std'):
+            saved = {bool(e[flag]) for e in entries if flag in e}
+            if len(saved) == 1 and saved != {bool(getattr(self, flag))}:
+                logger.warning(
+                    f"{path} was computed with {flag}={next(iter(saved))}, the "
+                    f"config sets {flag}={getattr(self, flag)}; using the file."
+                )
+                setattr(self, flag, next(iter(saved)))
+
+        missing = sorted(set(self.dataset_object_count) - set(stats))
+        if not missing:
+            return
+        if is_global:
+            for d in missing:
+                stats[d] = entries[0]
+            logger.info(f"Applied the global stats of {path} to {missing}.")
+            return
+        # The general dataset is processed like objaverse: a per-dataset file
+        # without a general entry normalizes it with the objaverse entry, so
+        # general data can be added for a fine-tune.
+        for d, like in STATS_FALLBACK.items():
+            if d in missing and like in stats:
+                stats[d] = stats[like]
+                missing.remove(d)
+                logger.info(f"{path} has no {d!r} stats; using its {like!r} entry for them.")
+        with_clips = [d for d in missing
+                      if sum(self.dataset_object_count[d].values()) > 0]
+        if with_clips:
+            raise ValueError(
+                f"{path} holds per-dataset stats for {sorted(stats)} and none "
+                f"for {with_clips}, whose clips could not be normalized."
+            )
 
     def _stats_frame_weighted(self, d_type=None):
         """Pool all frames equally. ``d_type=None`` pools across all dataset types."""
@@ -1351,11 +1677,65 @@ class MotionDataset(data.Dataset):
     def save_dataset_stats(self, path):
         """Persist ``self.dataset_stats`` as a pickled .npy. Inference
         reloads with ``np.load(path, allow_pickle=True).item()``.
+
+        Written to a temp file and renamed: a resumed run rewrites the file it
+        loaded its stats from while other ranks may still be reading it.
         """
         if os.path.dirname(path):
             os.makedirs(os.path.dirname(path), exist_ok=True)
-        np.save(path, self.dataset_stats, allow_pickle=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, 'wb') as f:   # a file object keeps np.save from appending .npy
+            np.save(f, self.dataset_stats, allow_pickle=True)
+        os.replace(tmp, path)
         logger.info(f"Saved dataset stats to {path}")
+
+
+class SkeletonDataset(data.Dataset):
+    """A :class:`MotionDataset` that loads no feature directory, for sampling.
+
+    It holds a run's normalization stats (``stats_path``, required) and padded
+    widths, and nothing else until skeletons are added with
+    ``motion_dataset.add_cond_object`` (each with its rest pose and, for
+    in-betweening / motion editing, the clips it is given). Sampling then needs
+    no dataset on disk beyond what the skeletons themselves come from.
+    ``create_sample_condition`` takes it like a :class:`Mixture`.
+    """
+
+    def __init__(self, stats_path: str, max_motion_length: int, max_joints: int,
+                 max_depth: int, topology_condition_type: str = 'tpos',
+                 feature_len: int = 12, text_encoder_type: str = "t5",
+                 text_encoder_version: str = "t5-base", use_dataset_stats: bool = True,
+                 balanced_stats: bool = False, tie_std: bool = False, max_freqs: int = 8,
+                 ground_motion_height: bool = True, realign_feature: bool = True):
+        if not stats_path or not os.path.isfile(stats_path):
+            raise FileNotFoundError(f"Normalization stats {stats_path!r} not found.")
+        self.motion_dataset = MotionDataset(
+            data_dict={},
+            topology_condition_type=topology_condition_type,
+            max_motion_length=max_motion_length,
+            config_max_depth=max_depth,
+            feature_len=feature_len,
+            text_encoder_type=text_encoder_type,
+            text_encoder_version=text_encoder_version,
+            use_dataset_stats=use_dataset_stats,
+            balanced_stats=balanced_stats,
+            tie_std=tie_std,
+            max_freqs=max_freqs,
+            ground_motion_height=ground_motion_height,
+            realign_feature=realign_feature,
+            prebuilt_max_joints=max_joints,
+            prebuilt_max_depth=max_depth,
+            target_object_types=set(),
+            stats_path=stats_path,
+        )
+        self.max_joints = self.motion_dataset.max_joints
+        self.max_depth = self.motion_dataset.max_depth
+
+    def __getitem__(self, item):
+        return self.motion_dataset[item]
+
+    def __len__(self):
+        return len(self.motion_dataset)
 
 
 # ---------------------------------------------------------------------------
@@ -1374,18 +1754,24 @@ class MixtureSampler(data.Sampler):
       alpha=1.0 : uniform per type (ignores motion count entirely)
       dataset_alpha=0.0 : each dataset keeps its natural share of the clips
       dataset_alpha=1.0 : equal probability per dataset
-      dataset_alpha=None: single level (default, the behaviour before 2026-09-27) —
+      dataset_weights={d: w}: explicit first level instead — dataset d gets
+          total probability w_d / sum(w) whatever its size (a dataset with no
+          training clips drops out and the rest are renormalized).
+      dataset_alpha=None: single level (default) —
           object types pooled across all datasets. A dataset of one rig (Mixamo)
-          then counts as one type and falls below 1% of a UniML3D mixture; the
-          *_v2 configs set 0.25.
+          then counts as one type and falls below 1% of a UniML3D mixture.
 
     With one dataset both levels coincide with the legacy behaviour.
 
     This is a plain Sampler (not DistributedSampler) that yields all indices.
     Accelerate's BatchSamplerShard handles per-rank sharding automatically.
+    Each epoch draws with a generator seeded from ``seed`` and the epoch — the
+    same on every rank, so the shards stay disjoint — so runs with different
+    seeds see different draw orders (seed 0 gives the epoch-only order).
     """
 
-    def __init__(self, data_source, alpha: float = 0.5, dataset_alpha=None):
+    def __init__(self, data_source, alpha: float = 0.5, dataset_alpha=None,
+                 dataset_weights=None, seed: int = 0):
         super().__init__(data_source)
 
         name_list = data_source.motion_dataset.train_name_list
@@ -1403,7 +1789,17 @@ class MixtureSampler(data.Sampler):
             objects_by_dataset[key[0]].append(key)
 
         weights = np.zeros(total_samples)
-        if dataset_alpha is None:
+        if dataset_alpha is not None and dataset_weights is not None:
+            raise ValueError("Pass dataset_alpha or dataset_weights, not both")
+        if dataset_weights is not None:
+            missing = sorted(set(objects_by_dataset) - set(dataset_weights))
+            if missing:
+                raise ValueError(f"dataset_weights has no weight for {missing}")
+            absent = sorted(set(dataset_weights) - set(objects_by_dataset))
+            if absent:
+                logger.warning(f'MixtureSampler: no training clips in {absent}; '
+                               f'their weight is dropped and the rest renormalized')
+        if dataset_alpha is None and dataset_weights is None:
             # w_i = n_k^(-alpha) for sample i in type k, giving type k total
             # probability ∝ n_k * n_k^(-alpha) = n_k^(1-alpha).
             for indices in indices_by_object.values():
@@ -1411,7 +1807,8 @@ class MixtureSampler(data.Sampler):
         else:
             for d_type, keys in objects_by_dataset.items():
                 n_d = sum(len(indices_by_object[k]) for k in keys)
-                d_share = n_d ** (1 - dataset_alpha)
+                d_share = (float(dataset_weights[d_type]) if dataset_weights is not None
+                           else n_d ** (1 - dataset_alpha))
                 type_mass = {k: len(indices_by_object[k]) ** (1 - alpha) for k in keys}
                 z = sum(type_mass.values())
                 for k in keys:
@@ -1421,7 +1818,9 @@ class MixtureSampler(data.Sampler):
         weights /= weights.sum()
         dataset_probs = {d: sum(weights[indices_by_object[k]].sum() for k in keys)
                          for d, keys in objects_by_dataset.items()}
-        logger.info(f'MixtureSampler (alpha={alpha}, dataset_alpha={dataset_alpha}): '
+        level1 = (f'dataset_weights={dataset_weights}' if dataset_weights is not None
+                  else f'dataset_alpha={dataset_alpha}')
+        logger.info(f'MixtureSampler (alpha={alpha}, {level1}): '
                     + ', '.join(f'{d} n={sum(len(indices_by_object[k]) for k in keys)} '
                                 f'p={dataset_probs[d]:.3f}'
                                 for d, keys in objects_by_dataset.items()))
@@ -1440,6 +1839,7 @@ class MixtureSampler(data.Sampler):
 
         self.weights = torch.as_tensor(weights, dtype=torch.double)
         self.total_samples = total_samples
+        self.seed = seed
         self.epoch = 0
 
     def set_epoch(self, epoch):
@@ -1447,7 +1847,9 @@ class MixtureSampler(data.Sampler):
 
     def __iter__(self):
         g = torch.Generator()
-        g.manual_seed(self.epoch)
+        # Spread seeds apart so seed s at epoch e never replays seed s + 1;
+        # wrapped to 63 bits, which manual_seed accepts for any seed.
+        g.manual_seed((self.seed * 1_000_003 + self.epoch) % (1 << 63))
         indices = torch.multinomial(
             self.weights, self.total_samples, replacement=True, generator=g
         ).tolist()
@@ -1493,11 +1895,22 @@ class Mixture(data.Dataset):
         target_object_types: Optional[Set[str]] = None,
         target_clip_stems: Optional[Set[str]] = None,
         stats_path: Optional[str] = None,
+        generic_caption_prob: float = 0.0,
+        detail_caption_prob: float = 0.0,
     ):
         logger.info(f'Initializing Mixture Dataset with datasets: {list(data_configs.keys())}')
+        # Extra caption versions are only read when a training run samples them.
+        training = target_object_types is None
+        probs = {'generic': generic_caption_prob if training else 0.0,
+                 'detail': detail_caption_prob if training else 0.0}
+        # A saved (padded) width carries one joint of joint-addition headroom;
+        # the skeleton filter is the width the training data had.
+        filter_max_joints = (prebuilt_max_joints - 1 if prebuilt_max_joints > 0 and use_addition_aug
+                             else max_joints)
         data_dict = {
             dataset_config.type: self._build_dataset_entry(
-                dataset_config, min_joints, max_joints,
+                dataset_config, min_joints, filter_max_joints,
+                tuple(v for v, p in probs.items() if p > 0),
             )
             for _, dataset_config in data_configs.items()
         }
@@ -1528,6 +1941,8 @@ class Mixture(data.Dataset):
             target_object_types=target_object_types,
             target_clip_stems=target_clip_stems,
             stats_path=stats_path,
+            generic_caption_prob=probs['generic'],
+            detail_caption_prob=probs['detail'],
         )
         if target_object_types is None:
             # Training only: inference can produce a tiny (even empty) split.
@@ -1541,9 +1956,12 @@ class Mixture(data.Dataset):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _build_dataset_entry(dataset_config, min_joints, max_joints):
+    def _build_dataset_entry(dataset_config, min_joints, max_joints,
+                             caption_versions=()):
         """Build the ``data_dict`` entry for one dataset: load cond / captions
-        / test_objects, apply dataset-specific and joint-count filters.
+        (+ ``captions_<v>.json`` for each extra version in
+        ``caption_versions``) / test_objects, apply dataset-specific and
+        joint-count filters.
         """
         root_dir = dataset_config.path
         dataset_type = dataset_config.type
@@ -1552,6 +1970,9 @@ class Mixture(data.Dataset):
 
         cond_dict = Mixture._load_cond_dict(root_dir)
         captions = Mixture._load_captions(root_dir, dataset_type)
+        extra = {f'captions_{v}': Mixture._load_captions(root_dir, dataset_type,
+                                                         f'captions_{v}.json')
+                 for v in caption_versions}
         test_objects = Mixture._load_test_objects(root_dir, dataset_type)
 
         cond_dict = Mixture._apply_dataset_filters(cond_dict, dataset_config, root_dir)
@@ -1562,6 +1983,7 @@ class Mixture(data.Dataset):
             'motion_dir': motion_dir,
             'cond_dict': cond_dict,
             'captions': captions,
+            **extra,
             'test_objects': test_objects,
         }
 
@@ -1572,16 +1994,20 @@ class Mixture(data.Dataset):
         return np.load(cond_file, allow_pickle=True).item()
 
     @staticmethod
-    def _load_captions(root_dir, dataset_type):
-        """Load the flat ``{clip_stem: caption}`` dict from ``captions.json``.
+    def _load_captions(root_dir, dataset_type, filename='captions.json'):
+        """Load a flat ``{clip_stem: caption}`` dict (``captions.json``,
+        ``captions_generic.json`` or ``captions_detail.json``).
 
-        The feature-extraction stage writes it whenever any clip has a
-        caption; a missing file means the dataset is caption-free.
+        The feature-extraction stage writes them whenever any clip has a
+        caption; a missing ``captions.json`` means the dataset is caption-free,
+        a missing ``captions_<v>.json`` that its clips have only the normal
+        caption (and the other versions present).
         """
-        captions_file = pjoin(root_dir, 'captions.json')
+        captions_file = pjoin(root_dir, filename)
         if not os.path.exists(captions_file):
-            logger.info(f'{dataset_type.capitalize()}: no captions.json in '
-                        f'{root_dir} (caption-free dataset)')
+            logger.info(f'{dataset_type.capitalize()}: no {filename} in '
+                        f'{root_dir}' + (' (caption-free dataset)'
+                                         if filename == 'captions.json' else ''))
             return {}
         with open(captions_file) as f:
             captions = json.load(f)
@@ -1614,7 +2040,7 @@ class Mixture(data.Dataset):
         """Dispatch to per-dataset filter (subset / object filter / count cap)."""
         if dataset_config.type == 'truebones':
             return Mixture._filter_truebones(cond_dict, dataset_config, root_dir)
-        if dataset_config.type == 'objaverse':
+        if dataset_config.type in ('objaverse', 'general'):
             return Mixture._filter_objaverse(cond_dict, dataset_config, root_dir)
         return cond_dict
 
@@ -1641,7 +2067,8 @@ class Mixture(data.Dataset):
 
     @staticmethod
     def _filter_objaverse(cond_dict, dataset_config, root_dir):
-        """Apply objaverse-specific filters: filter_object + objects_num cap."""
+        """Apply the objaverse / general filters: filter_object + objects_num cap."""
+        label = dataset_config.type.capitalize()
         if dataset_config.filter_object:
             filter_path = pjoin(root_dir, 'filtered_objects.txt')
             if os.path.exists(filter_path):
@@ -1650,19 +2077,19 @@ class Mixture(data.Dataset):
                 before = len(cond_dict)
                 cond_dict = {k: v for k, v in cond_dict.items() if k not in excluded}
                 logger.info(
-                    f'Objaverse: filter_object removed {before - len(cond_dict)} '
+                    f'{label}: filter_object removed {before - len(cond_dict)} '
                     f'of {before} object types via {filter_path}'
                 )
             else:
                 logger.info(
-                    f'Objaverse: filter_object=True but no filtered_objects.txt '
+                    f'{label}: filter_object=True but no filtered_objects.txt '
                     f'at {filter_path}; skipping filtering.'
                 )
         objects_num = dataset_config.objects_num
         if objects_num > 0:
             keys = sorted(cond_dict.keys())[:objects_num]
             cond_dict = {k: cond_dict[k] for k in keys}
-        logger.info(f'Objaverse Dataset has {len(cond_dict)} object types')
+        logger.info(f'{label} Dataset has {len(cond_dict)} object types')
         return cond_dict
 
     @staticmethod

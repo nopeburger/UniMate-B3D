@@ -9,6 +9,16 @@ Pipeline: import → select armature/mesh → extract animation → Z-up → Y-u
 prune skeleton (shared across the species' clips) → save per-clip NPZ + MP4
 + rest-pose PNG.
 
+``--save_glb`` also writes ``rigs/<species>.glb``: the species in its rest
+pose on the pruned skeleton, without animation (``processed_assets.export_asset_glb``),
+built from the FBX of one clip on the species' main skeleton (its
+``joint_names.json`` entry); every clip NPZ of that skeleton drives it as a
+character (``mesh_animation``). Clips of another rig variant (KingCobra and
+Monkey ship two) are logged; drive those from their FBX. On an existing export
+it only adds the missing GLBs (the NPZs are not rewritten). ``--glb_only`` does
+only that, also for an export without completion markers (the released one),
+and writes nothing else; it shards species with ``--num_workers``.
+
 Usage (Blender headless):
     blender -b -P data_process/motion_export/export_truebones.py -- \
         --data_dir dataset/raw/truebones/animation \
@@ -31,9 +41,14 @@ from data_process.utils.blender_export import (
     load_scene, prepare_skeleton, extract_all_actions, save_rest_pose_vis,
     prune_skeleton_shared,
     action_frame_range, sanitize_action_name, sanitize_object_type,
-    save_motion, write_export_summary,
+    save_motion, write_export_summary, truebones_clip_name,
     is_asset_complete, mark_asset_complete,
 )
+from data_process.utils.asset_files import (
+    asset_glb_missing, log_other_skeletons, main_skeleton_clips, record_glb_error,
+    REPLACED_DIR, remove_asset_glb, report_glb_errors, set_aside_old_clips,
+)
+from data_process.utils.processed_assets import build_asset_glb
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -114,23 +129,70 @@ def postprocess_and_save(obj_type, extracted, rest_anim_shared, bone_names,
 # Per-species export
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Clips (source FBXs) tried for a species' processed GLB before giving up.
+MAX_GLB_ATTEMPTS = 3
+
+
+def save_species_glb(obj_type, fbx_paths, output_dir, fps=30, want=None):
+    """The species' processed GLB, from the FBX of its first clip on the main
+    skeleton (*want* joint names, else its ``joint_names.json`` entry; see
+    ``asset_files.main_skeleton_clips``). A failure is recorded, not raised."""
+    main, others = main_skeleton_clips(output_dir, obj_type, want=want)
+    log_other_skeletons(obj_type, others)
+    fbx_by_clip = {}
+    for fbx_path in fbx_paths:
+        try:
+            fbx_by_clip[truebones_clip_name(Path(fbx_path).stem)] = fbx_path
+        except ValueError:
+            continue
+    candidates = [(npz_path, fbx_by_clip[os.path.basename(npz_path)[:-4]]) for npz_path in main
+                  if os.path.basename(npz_path)[:-4] in fbx_by_clip]
+    # The next main-skeleton clip if one fails (a bad FBX), but not every one:
+    # a failure that repeats is the asset's, and is recorded by build_asset_glb.
+    for npz_path, fbx_path in candidates[:MAX_GLB_ATTEMPTS]:
+        if build_asset_glb(obj_type, npz_path, output_dir,
+                           lambda: load_scene(import_fbx, fbx_path, fps=fps)[0],
+                           source_path=fbx_path):
+            return
+    if not candidates:
+        record_glb_error(output_dir, obj_type,
+                         f"'{obj_type}': no source FBX in the input for any of its "
+                         f"{len(main)} main-skeleton clip(s); processed GLB not built")
+
+
 def export_species(species, fbx_paths, output_dir, fps=30, dtype=np.float64,
-                   min_frames=5, consider_parent_rotate=True, save_vis=True):
+                   min_frames=5, consider_parent_rotate=True, save_vis=True,
+                   save_glb=False, glb_only=False):
     """Export one species: extract each of its per-clip FBX files, then prune
-    the skeleton jointly across all clips and save them."""
+    the skeleton jointly across all clips and save them. ``save_glb`` also
+    writes the species' processed GLB, ``glb_only`` only that (module
+    docstring)."""
 
     obj_type = sanitize_object_type(species)
 
-    if is_asset_complete(output_dir, obj_type):
-        logger.info(f"Species '{obj_type}' already complete, skipping.")
+    if glb_only:
+        # Existing NPZs only, markers or not; never (re-)exports.
+        if asset_glb_missing(output_dir, obj_type):
+            save_species_glb(obj_type, fbx_paths, output_dir, fps=fps)
         return {}
+
+    if is_asset_complete(output_dir, obj_type):
+        if save_glb and asset_glb_missing(output_dir, obj_type):
+            logger.info(f"Species '{obj_type}' already exported; adding its processed GLB.")
+            save_species_glb(obj_type, fbx_paths, output_dir, fps=fps)
+        else:
+            logger.info(f"Species '{obj_type}' already complete, skipping.")
+        return {}
+    remove_asset_glb(output_dir, obj_type)
     motion_save_dir = os.path.join(output_dir, "motions")
     existing = sorted(Path(motion_save_dir).glob(f"{obj_type}-*.npz")) if os.path.isdir(motion_save_dir) else []
     if existing:
         # Pruning is joint across all of a species' clips, so a partial
         # (or pre-marker) export must be redone as a whole.
         logger.warning(f"'{obj_type}' has {len(existing)} clip(s) but no completion "
-                       f"marker (partial or pre-marker export); re-exporting.")
+                       f"marker (partial or pre-marker export); re-exporting; the old clips go to "
+                       f"{REPLACED_DIR}/.")
+        set_aside_old_clips(output_dir, obj_type)
 
     # A few species ship rig variants (different node counts or container
     # names — e.g. KingCobra's extra Null, Monkey's A01/B01/B02 containers).
@@ -139,6 +201,7 @@ def export_species(species, fbx_paths, output_dir, fps=30, dtype=np.float64,
     # separately. The dominant group defines the species' joint_names entry
     # and rest-pose PNG.
     groups = {}  # names signature -> {'rest_anim', 'skin_matrix', 'extracted'}
+    import_failures = []
     for fbx_path in fbx_paths:
         stem = Path(fbx_path).stem
         species_part, sep, action_name = stem.partition('-')
@@ -152,8 +215,9 @@ def export_species(species, fbx_paths, output_dir, fps=30, dtype=np.float64,
 
         try:
             result = extract_single_fbx(fbx_path, fps=fps, dtype=dtype)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — finish the species, then fail it
             logger.warning(f"Failed to extract {fbx_path}: {e}")
+            import_failures.append(f"{os.path.basename(fbx_path)}: {e}")
             continue
 
         nframes = result['anim'].positions.shape[0]
@@ -194,9 +258,19 @@ def export_species(species, fbx_paths, output_dir, fps=30, dtype=np.float64,
     else:
         logger.info(f"No valid FBX files extracted for '{obj_type}'; skipping.")
 
+    if import_failures:
+        # No completion marker: a rerun redoes the species with every clip
+        # (pruning is joint across them), and the batch exits non-zero.
+        raise RuntimeError(f"{len(import_failures)} of {len(fbx_paths)} clip(s) of "
+                           f"'{obj_type}' failed to extract: " + '; '.join(import_failures))
     mark_asset_complete(output_dir, obj_type,
                         status="exported" if saved else "skipped",
                         joint_names=saved.get(obj_type))
+    # After the marker, on the skeleton this run saved as the species' own
+    # (joint_names.json is only rewritten at the end of the run): a failure is
+    # recorded, not raised, and a rerun with --glb_only adds the missing GLB.
+    if save_glb and saved:
+        save_species_glb(obj_type, fbx_paths, output_dir, fps=fps, want=saved[obj_type])
     return saved
 
 
@@ -220,12 +294,29 @@ def parse_args():
                              "(see prune_skeleton_shared; use --no-consider_parent_rotate to disable).")
     parser.add_argument('--vis', action=argparse.BooleanOptionalAction, default=True,
                         help="Render the per-clip MP4 preview (use --no-vis for bulk runs).")
+    parser.add_argument('--save_glb', action='store_true',
+                        help="Also write rigs/<species>.glb: the species in its rest pose on the "
+                             "pruned skeleton (no animation; the clip NPZs drive it), for "
+                             "mesh_animation. On an existing export, only the missing GLBs are added.")
+    parser.add_argument('--glb_only', action='store_true',
+                        help="Only add missing rigs/<species>.glb to an existing export, for the "
+                             "species whose NPZs are already in motions/: no NPZ, completion marker "
+                             "or summary JSON is written, and none is required.")
+    parser.add_argument('--worker_id', type=int, default=0,
+                        help="Worker index when sharding species across processes "
+                             "(--glb_only only).")
+    parser.add_argument('--num_workers', type=int, default=1,
+                        help="Total number of workers (--glb_only only: a full export writes "
+                             "one set of summary JSONs, so it stays single-process).")
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else sys.argv[1:]
     return parser.parse_args(argv)
 
 
 def main():
     args = parse_args()
+    if args.num_workers > 1 and not args.glb_only:
+        raise SystemExit("--num_workers > 1 needs --glb_only: a full Truebones export "
+                         "is single-process (it writes one set of summary JSONs).")
 
     fbx_files = sorted(f for f in os.listdir(args.data_dir) if f.lower().endswith('.fbx'))
     by_species = {}
@@ -239,12 +330,17 @@ def main():
     error_log = os.path.join(args.output_dir, 'export_errors.log')
     all_joint_names = {}
     n_failed = 0
-    for species, fbx_paths in tqdm(sorted(by_species.items()), desc="Exporting species"):
+    species_items = sorted(by_species.items())
+    if args.num_workers > 1:
+        species_items = species_items[args.worker_id::args.num_workers]
+        logger.info(f"Worker {args.worker_id}/{args.num_workers}: {len(species_items)} species")
+    for species, fbx_paths in tqdm(species_items, desc="Exporting species"):
         try:
             saved = export_species(species, fbx_paths, output_dir=args.output_dir,
                                    fps=args.fps, min_frames=args.min_frames,
                                    consider_parent_rotate=args.consider_parent_rotate,
-                                   save_vis=args.vis)
+                                   save_vis=args.vis, save_glb=args.save_glb,
+                                   glb_only=args.glb_only)
             if saved:
                 all_joint_names.update(saved)
         except Exception as e:  # noqa: BLE001 — keep the batch going
@@ -253,7 +349,10 @@ def main():
             with open(error_log, 'a') as log_file:
                 log_file.write(f"Failed to export species {species}: {e}\n")
 
-    write_export_summary(args.output_dir, all_joint_names, fps=args.fps)
+    if not args.glb_only:
+        write_export_summary(args.output_dir, all_joint_names, fps=args.fps)
+    if args.save_glb or args.glb_only:
+        report_glb_errors(args.output_dir)
     if n_failed:
         logger.error(f"{n_failed}/{len(by_species)} species failed; see {error_log}")
         sys.exit(1)

@@ -36,7 +36,7 @@ CHAR_STEM=$(basename "${CHAR_PATH%.*}")
 OUTPUT_DIR=${OUTPUT_DIR:-outputs/animated_${CHAR_STEM}}
 CHAR_ANIM_TYPE=${CHAR_ANIM_TYPE:-fbx}
 
-blender -b -P data_process/mesh_animation/animate_fbx.py -- \
+blender -b --python-exit-code 1 -P data_process/mesh_animation/animate_fbx.py -- \
     --char_path="$CHAR_PATH" \
     --anim_path="$ANIM_PATH" \
     --output_dir="$OUTPUT_DIR" \

@@ -114,7 +114,8 @@ def build_joint_keep_mask(
     Logs a warning per sample for any ``keep_names`` entries that don't
     match a joint in that skeleton — a single keep list is typically applied
     across heterogeneous skeletons (different topology, different naming),
-    so partial matches are expected and shouldn't fail the run.
+    so partial matches are expected and shouldn't fail the run; a batch in
+    which nothing matches gets an all-False mask (sampled unconstrained).
 
     Args:
         joint_names_per_sample: per-sample lists of joint name strings,
@@ -152,9 +153,10 @@ def build_joint_keep_mask(
             )
 
     if total_hits == 0:
-        raise ValueError(
+        logger.warning(
             f"build_joint_keep_mask: no keep_joints matched any skeleton in "
-            f"the batch (keep_names={keep_names}). Check spelling against the "
-            f"clip's joint_names or clean_joint_names."
+            f"this batch (keep_names={keep_names}); its samples are generated "
+            f"unconstrained. Check spelling against the clip's joint_names or "
+            f"clean_joint_names."
         )
     return mask

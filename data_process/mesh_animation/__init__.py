@@ -8,11 +8,10 @@ Entry points (all run under Blender headless, ``blender -b -P <script> -- <args>
 - ``animate_mixamo``  — batch wrapper pairing one character with a directory of NPZs
 - ``animate_lbs``     — manual NumPy FK+LBS: deform a rigged asset's skinned mesh
   directly with a motion NPZ (either flavor) and save the vertex animation
-- ``preprocess_char`` — run one rigged, animated asset through the real export +
-  feature pipeline in-process: writes export NPZs, motion-feature NPZs, the
-  model-side ``cond.npy``, and a canonical rest-pose GLB/FBX that feature NPZs
-  drive through ``animate_lbs`` cond-free
+- one rigged asset → ``cond.npy`` + canonical rest-pose GLB: ``data_process.rig_preprocess``
 
-Shared plumbing lives in :mod:`.common`; rig primitives in
+Shared plumbing lives in :mod:`.common` (processed-asset lookup, keyframe-and-
+export core); the canonical rest-pose bake in :mod:`.canonical_rig` (also used
+by ``feature_extraction/canonical_assets.py``); rig primitives in
 :mod:`data_process.utils.blender_rig`.
 """

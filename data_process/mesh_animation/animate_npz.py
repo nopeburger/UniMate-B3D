@@ -9,6 +9,11 @@ round-trip checks of the export and for re-rendering exported clips.
 For *generated* motions (feature NPZ + ``cond.npy``) use
 :mod:`data_process.mesh_animation.animate_motion` instead.
 
+``--char_path`` may be omitted with ``--dataset_type``: the processed export
+asset ``dataset/export/<ds>/rigs/<name>.glb`` is used (run_export.sh
+--save_glb / --glb_only), whose skeleton is the NPZ's, so nothing is merged;
+<name> is the clip's object type, for Mixamo ``--character`` (default Michelle).
+
 Usage (Blender headless):
     blender -b -P data_process/mesh_animation/animate_npz.py -- \\
         --char_path my_model.glb \\
@@ -28,11 +33,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from Animation import Animation, Quaternions  # noqa: E402
 
 from data_process.mesh_animation.common import (  # noqa: E402
+    DEFAULT_MIXAMO_CHARACTER,
     clip_output_path,
     drive_and_export,
     load_character,
     npz_scalar,
     parse_blender_argv,
+    resolve_processed_asset,
 )
 from data_process.utils.blender_rig import EXTRA_BONES_STRATEGIES  # noqa: E402
 
@@ -103,8 +110,14 @@ def animate_character(char_path, anim_path, output_dir, char_anim_type='glb',
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Drive a rigged character with an exported motion NPZ.")
-    parser.add_argument("--char_path", type=str, required=True,
-                        help="Character FBX/GLB (mesh + armature).")
+    parser.add_argument("--char_path", type=str, default=None,
+                        help="Character FBX/GLB (mesh + armature). Default with "
+                             "--dataset_type: the processed export asset.")
+    parser.add_argument("--dataset_type", type=str, default=None,
+                        choices=['truebones', 'objaverse', 'mixamo', 'general'],
+                        help="Resolve --char_path from dataset/export/<ds>/rigs/.")
+    parser.add_argument("--character", type=str, default=None,
+                        help=f"Mixamo character (default {DEFAULT_MIXAMO_CHARACTER}).")
     parser.add_argument("--anim_path", type=str, required=True,
                         help="Export-stage motion NPZ whose bone names match the rig.")
     parser.add_argument("--output_dir", type=str, default='outputs/animated')
@@ -117,8 +130,14 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+    char_path = args.char_path
+    if char_path is None:
+        if not args.dataset_type:
+            raise SystemExit("--char_path is required without --dataset_type")
+        char_path = resolve_processed_asset(args.anim_path, args.dataset_type, 'export',
+                                            args.character)
     animate_character(
-        char_path=args.char_path,
+        char_path=char_path,
         anim_path=args.anim_path,
         output_dir=args.output_dir,
         char_anim_type=args.char_anim_type,

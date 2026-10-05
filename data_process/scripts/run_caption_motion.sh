@@ -3,7 +3,7 @@
 # The backend is picked from MODEL, with the same rules as detect_backend() in
 # vlm_caption/backends.py:
 #   *qwen* (default, any case) -> local Qwen3.5 / Qwen3.8 / Qwen3-VL (GPU-bound; supports --multi-gpu)
-#   gemini*                    -> Gemini API    (needs GOOGLE_API_KEY)
+#   *gemini*                   -> Gemini API    (needs GOOGLE_API_KEY)
 #   anything else              -> OpenAI-compatible API (needs OPENAI_API_KEY)
 #
 # Usage:
@@ -13,6 +13,7 @@
 #   MODEL=Qwen/Qwen3-VL-8B-Instruct bash data_process/scripts/run_caption_motion.sh objaverse
 #   MODEL=gemini-3-flash-preview bash data_process/scripts/run_caption_motion.sh objaverse
 #   MODEL=gpt-5-mini NUM_WORKERS=16 bash data_process/scripts/run_caption_motion.sh mixamo
+#   bash data_process/scripts/run_caption_motion.sh general     # extra assets (objaverse prompt)
 #
 # Env overrides:
 #   MODEL, RENDER_ROOT (default: dataset/render/<dataset>),
@@ -20,6 +21,9 @@
 #   DOWNSAMPLE_RATE, MAX_TOKENS, NUM_WORKERS, MAX_RETRIES, BASE_URL (OpenAI-compatible proxy),
 #   THINKING_LEVEL / MEDIA_RESOLUTION (gemini-3), THINKING_BUDGET (gemini-2.5)
 # Unrecognized arguments are passed through to caption_motion.py.
+# Exit status: 0 when every clip got a caption, 3 when the run finished but some
+# clips did not (listed in the *_failed.txt next to OUTPUT_JSON; rerun to retry
+# them; --multi-gpu still merges the shards), 1 on a crash.
 # On offline compute nodes with a populated HuggingFace cache, export
 # HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1.
 
@@ -28,7 +32,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
 # ── Arguments ────────────────────────────────────────────────────────────────
 handle_help "$@"
-DATASET=${1:?Usage: run_caption_motion.sh <truebones|mixamo|objaverse> [--multi-gpu] [extra args...]}
+DATASET=${1:?Usage: run_caption_motion.sh <truebones|mixamo|objaverse|general> [--multi-gpu] [extra args...]}
 shift
 require_dataset "$DATASET"
 
@@ -139,10 +143,19 @@ if [[ "$MODE" == "multi-gpu" ]]; then
         echo "  Started GPU $gpu_id (PID ${pids[-1]})"
     done
 
+    # Exit 3 = finished with some clips uncaptioned (caption_motion.EXIT_CLIPS_FAILED):
+    # merge anyway, then report it; any other non-zero status is a crash.
     failed=0
+    partial=0
     for gpu_id in "${!pids[@]}"; do
-        wait "${pids[gpu_id]}" \
-            || { echo "GPU $gpu_id failed (log: $LOG_DIR/gpu${gpu_id}.log)" >&2; failed=1; }
+        status=0
+        wait "${pids[gpu_id]}" || status=$?
+        if [[ $status -eq 3 ]]; then
+            partial=1
+        elif [[ $status -ne 0 ]]; then
+            echo "GPU $gpu_id failed (log: $LOG_DIR/gpu${gpu_id}.log)" >&2
+            failed=1
+        fi
     done
     if [[ $failed -ne 0 ]]; then
         echo "Some processes failed. Shard files preserved for inspection." >&2
@@ -153,6 +166,10 @@ if [[ "$MODE" == "multi-gpu" ]]; then
     python -m data_process.vlm_caption.caption_motion \
         --task="$DATASET" --merge_shards --output_json="$OUTPUT_JSON" --num_gpus="$num_gpus"
     echo "Done! Output: $OUTPUT_JSON"
+    if [[ $partial -ne 0 ]]; then
+        echo "Some clips failed to caption (see the *_failed.txt next to $OUTPUT_JSON); rerun to retry them." >&2
+        exit 3
+    fi
 else
     python -m data_process.vlm_caption.caption_motion \
         "${COMMON[@]}" "${EXTRA[@]}" "${PASSTHRU[@]}"

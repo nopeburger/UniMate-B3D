@@ -2,7 +2,7 @@
 # Stage 3 — rule-based joint-name cleaning: joint_names.json -> clean_joint_names.json.
 #
 # Usage:
-#   bash data_process/scripts/run_joints_names_clean_rule.sh <truebones|mixamo|objaverse> [--report]
+#   bash data_process/scripts/run_joints_names_clean_rule.sh <truebones|mixamo|objaverse|general> [--report]
 #
 # Env overrides: INPUT, OUTPUT (default: inside dataset/export/<dataset>)
 
@@ -11,7 +11,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
 handle_help "$@"
 
-DATASET=${1:?Usage: run_joints_names_clean_rule.sh <truebones|mixamo|objaverse> [extra args...]}
+DATASET=${1:?Usage: run_joints_names_clean_rule.sh <truebones|mixamo|objaverse|general> [extra args...]}
 shift
 require_dataset "$DATASET"
 

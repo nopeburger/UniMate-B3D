@@ -32,6 +32,11 @@ fi
 unset PYTHONSTARTUP PYTHONBREAKPOINT
 
 # ── Default dataset layout (relative to PROJECT_ROOT) ───────────────────────
+# <dataset> is truebones | mixamo | objaverse, or general: extra training
+# assets of your own, one rigged GLB (GLTF / FBX also accepted) per object in
+# dataset/raw/general/animation/ (GENERAL_RAW_DIR), each holding that asset's
+# clips as named animations, processed like objaverse. No shipped config
+# trains on it; add "general" to dataset.dataset_list to use it.
 #   dataset/raw/<dataset>/                    raw FBX / GLB assets
 #   dataset/export/<dataset>/                 stage-1 export + stage-2/3 metadata
 #   dataset/render/<dataset>/                 multi-view renders (captioning input)
@@ -41,13 +46,16 @@ export_dir()    { echo "dataset/export/$1"; }
 render_dir()    { echo "dataset/render/$1"; }
 tpose_dir()     { echo "dataset/render/${1}_tpose"; }
 features_dir()  { echo "dataset/features/$1"; }
+# The general dataset's input assets: the only part of dataset/raw/general the
+# pipeline reads.
+GENERAL_RAW_DIR=dataset/raw/general/animation
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 # require_dataset <name> : validate a dataset name.
 require_dataset() {
     case "$1" in
-        truebones|mixamo|objaverse) ;;
-        *) echo "Unknown dataset '$1' (expected: truebones | mixamo | objaverse)" >&2; exit 2 ;;
+        truebones|mixamo|objaverse|general) ;;
+        *) echo "Unknown dataset '$1' (expected: truebones | mixamo | objaverse | general)" >&2; exit 2 ;;
     esac
 }
 

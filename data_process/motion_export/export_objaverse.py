@@ -8,6 +8,15 @@ Files can be sharded across parallel Blender processes with
 ``--worker_id`` / ``--num_workers``; each worker writes its own summary
 JSONs (``*_worker{i}.json``).
 
+``--save_glb`` also writes ``rigs/<asset>.glb`` per asset: the asset in its
+rest pose on the pruned skeleton, without animation
+(``processed_assets.export_asset_glb``); every clip NPZ of the asset drives it as a
+character (``mesh_animation``). On an existing export it only adds the missing
+GLBs (the NPZs are not rewritten). ``--glb_only`` does only that, also for an
+export without completion markers (the released ones): it builds the missing
+GLBs of the assets whose NPZs are already in ``motions/`` and writes nothing
+else.
+
 Usage (Blender headless):
     blender -b -P data_process/motion_export/export_objaverse.py -- \
         --data_dir dataset/raw/objaverse/glb \
@@ -26,35 +35,62 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from data_process.utils.blender_export import (
+    asset_names,
     import_gltf, list_gltf_files, sanitize_action_name, unique_clip_names,
     load_scene, prepare_skeleton, extract_all_actions, save_rest_pose_vis,
     prune_skeleton_shared, remove_tpose_frames, discover_pose_actions,
     save_motion, write_export_summary,
     is_asset_complete, mark_asset_complete,
 )
+from data_process.utils.asset_files import (
+    REPLACED_DIR, asset_glb_missing, remove_asset_glb, report_glb_errors, set_aside_old_clips,
+)
+from data_process.utils.processed_assets import add_asset_glb, build_asset_glb
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main export pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
 def export_objaverse(gltf_path, save_name, output_dir, fps=30, dtype=np.float64,
-                     min_frames=5, consider_parent_rotate=True, save_vis=True):
-    """Export every pose action in one GLB/GLTF file. Returns ``{save_name: joint_names}``."""
+                     min_frames=5, consider_parent_rotate=True, save_vis=True,
+                     save_glb=False, glb_only=False):
+    """Export every pose action in one GLB/GLTF file. Returns ``{save_name: joint_names}``.
+
+    ``save_glb`` also writes the asset's processed GLB, ``glb_only`` only that
+    (module docstring).
+    """
     assert os.path.exists(gltf_path), f"GLTF file not found: {gltf_path}"
+
+    if glb_only:
+        # Existing NPZs only, markers or not; never (re-)exports.
+        if asset_glb_missing(output_dir, save_name):
+            add_asset_glb(save_name, output_dir,
+                          lambda: load_scene(import_gltf, gltf_path, fps=fps)[0],
+                          source_path=gltf_path)
+        return {}
 
     motion_save_dir = os.path.join(output_dir, "motions")
     vis_save_dir = os.path.join(output_dir, "videos")
     tpos_save_dir = os.path.join(output_dir, "tpose")
 
     if is_asset_complete(output_dir, save_name):
-        logger.info(f"Asset '{save_name}' already complete, skipping: {gltf_path}")
+        if not (save_glb and asset_glb_missing(output_dir, save_name)):
+            logger.info(f"Asset '{save_name}' already complete, skipping: {gltf_path}")
+            return {}
+        logger.info(f"Asset '{save_name}' already exported; adding its processed GLB")
+        add_asset_glb(save_name, output_dir,
+                      lambda: load_scene(import_gltf, gltf_path, fps=fps)[0],
+                      source_path=gltf_path)
         return {}
+    remove_asset_glb(output_dir, save_name)
     existing = sorted(Path(motion_save_dir).glob(f"{save_name}-*.npz")) if os.path.isdir(motion_save_dir) else []
     if existing:
         # Pruning is joint across all of an asset's clips, so a partial
         # (or pre-marker) export must be redone as a whole.
         logger.warning(f"'{save_name}' has {len(existing)} clip(s) but no completion "
-                       f"marker (partial or pre-marker export); re-exporting.")
+                       f"marker (partial or pre-marker export); re-exporting; the old clips go to "
+                       f"{REPLACED_DIR}/.")
+        set_aside_old_clips(output_dir, save_name)
 
     logger.info(f"Processing GLTF: {gltf_path}")
     os.makedirs(motion_save_dir, exist_ok=True)
@@ -122,6 +158,14 @@ def export_objaverse(gltf_path, save_name, output_dir, fps=30, dtype=np.float64,
                         n_clips=len(saved_clips),
                         reason="" if saved_clips else "no clips above min frame count",
                         joint_names=names_pruned if saved_clips else None)
+    # After the marker, from a clip this run saved and a fresh import (the
+    # scene now sits at the last extracted frame, and an animated armature
+    # object or parent empty would carry that pose): exactly what --glb_only
+    # builds. A failure is recorded, not raised.
+    if save_glb and saved_clips:
+        build_asset_glb(save_name, os.path.join(motion_save_dir, f"{saved_clips[0]}.npz"),
+                        output_dir, lambda: load_scene(import_gltf, gltf_path, fps=fps)[0],
+                        source_path=gltf_path)
 
     # Return once per asset (skeleton type), not per clip
     if saved_clips:
@@ -152,6 +196,14 @@ def parse_args():
                         help="Total number of workers.")
     parser.add_argument('--vis', action=argparse.BooleanOptionalAction, default=True,
                         help="Render the per-clip MP4 preview (use --no-vis for bulk runs).")
+    parser.add_argument('--save_glb', action='store_true',
+                        help="Also write rigs/<asset>.glb: the asset in its rest pose on the "
+                             "pruned skeleton (no animation; the clip NPZs drive it), for "
+                             "mesh_animation. On an existing export, only the missing GLBs are added.")
+    parser.add_argument('--glb_only', action='store_true',
+                        help="Only add missing rigs/<asset>.glb to an existing export, for the "
+                             "assets whose NPZs are already in motions/: no NPZ, completion marker "
+                             "or summary JSON is written, and none is required.")
 
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else sys.argv[1:]
     return parser.parse_args(argv)
@@ -163,6 +215,9 @@ def main():
     gltf_paths = list_gltf_files(Path(args.data_dir))
     assert len(gltf_paths) > 0, f"No GLB/GLTF files found in {args.data_dir}"
     logger.info(f"Found {len(gltf_paths)} GLB/GLTF files in {args.data_dir}")
+    # Same names as render_objaverse (identity for objaverse's hex ids);
+    # checked over the full list, before sharding, so every worker agrees.
+    names = asset_names(gltf_paths)
 
     # Shard files across workers
     if args.num_workers > 1:
@@ -175,10 +230,11 @@ def main():
     n_failed = 0
     for glb_path in tqdm(gltf_paths, desc="Exporting GLB/GLTF files"):
         try:
-            saved = export_objaverse(glb_path, glb_path.stem, output_dir=args.output_dir,
+            saved = export_objaverse(glb_path, names[glb_path], output_dir=args.output_dir,
                                      fps=args.fps, min_frames=args.min_frames,
                                      consider_parent_rotate=args.consider_parent_rotate,
-                                     save_vis=args.vis)
+                                     save_vis=args.vis, save_glb=args.save_glb,
+                                     glb_only=args.glb_only)
             if saved:
                 all_joint_names.update(saved)
         except Exception as e:  # noqa: BLE001 — keep the batch going
@@ -187,10 +243,13 @@ def main():
             with open(error_log, 'a') as log_file:
                 log_file.write(f"Failed to export {glb_path}: {e}\n")
 
-    worker_suffix = f"_worker{args.worker_id}" if args.num_workers > 1 else ""
-    write_export_summary(args.output_dir, all_joint_names, fps=args.fps,
-                         worker_suffix=worker_suffix)
+    if not args.glb_only:
+        worker_suffix = f"_worker{args.worker_id}" if args.num_workers > 1 else ""
+        write_export_summary(args.output_dir, all_joint_names, fps=args.fps,
+                             worker_suffix=worker_suffix)
 
+    if args.save_glb or args.glb_only:
+        report_glb_errors(args.output_dir)
     if n_failed:
         logger.error(f"{n_failed}/{len(gltf_paths)} assets failed; see {error_log}")
         sys.exit(1)

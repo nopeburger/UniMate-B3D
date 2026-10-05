@@ -6,11 +6,13 @@
 #   bash data_process/scripts/run_render_motion.sh truebones
 #   bash data_process/scripts/run_render_motion.sh objaverse --multi-worker 8
 #   bash data_process/scripts/run_render_motion.sh objaverse --missing-only
+#   bash data_process/scripts/run_render_motion.sh general --multi-worker 4
 #   DATA_DIR=outputs/mixamo_characters bash data_process/scripts/run_render_motion.sh mixamo
 #
-# Inputs per dataset: truebones/objaverse render the raw FBX/GLB assets;
-# mixamo renders the animated character files produced by
-# run_animate_mixamo.sh (raw Mixamo FBXs carry no mesh).
+# Inputs per dataset: truebones/objaverse/general render the raw FBX/GLB
+# assets (general: dataset/raw/general/animation, with the same file list, asset names
+# and actions as its exporter); mixamo renders the animated character files
+# produced by run_animate_mixamo.sh (raw Mixamo FBXs carry no mesh).
 #
 # Runs with plain python + the pip `bpy` module: EEVEE needs the module's
 # GPU context (`blender -b` has no display surface). --multi-worker N
@@ -43,10 +45,11 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --multi-worker) NUM_WORKERS="${2:?--multi-worker requires a value}"; shift 2 ;;
         --missing-only)
-            # Only render_objaverse.py implements the flag; the other two
-            # renderers would reject it from argparse after loading bpy.
-            if [[ "$DATASET" != "objaverse" ]]; then
-                echo "ERROR: --missing-only is only supported for objaverse (the other renderers resume per asset anyway)" >&2
+            # Only render_objaverse.py (and render_general.py, built on it)
+            # implements the flag; the other renderers would reject it from
+            # argparse after loading bpy.
+            if [[ "$DATASET" != "objaverse" && "$DATASET" != "general" ]]; then
+                echo "ERROR: --missing-only is only supported for objaverse and general (the other renderers resume per asset anyway)" >&2
                 exit 2
             fi
             EXTRA_ARGS+=("$1"); shift ;;
@@ -58,6 +61,7 @@ case "$DATASET" in
     truebones) DATA_DIR=${DATA_DIR:-dataset/raw/truebones/animation} ;;
     mixamo)    DATA_DIR=${DATA_DIR:-outputs/mixamo_characters} ;;
     objaverse) DATA_DIR=${DATA_DIR:-dataset/raw/objaverse/glb} ;;
+    general)   DATA_DIR=${DATA_DIR:-$GENERAL_RAW_DIR} ;;
 esac
 OUTPUT_DIR=${OUTPUT_DIR:-$(render_dir "$DATASET")}
 
@@ -78,9 +82,9 @@ if [[ "$NUM_WORKERS" -gt 1 ]]; then
     echo "Launching $NUM_WORKERS render workers (per-worker logs: $LOG_DIR)..."
     pids=()
     for worker_id in $(seq 0 $((NUM_WORKERS - 1))); do
-        # Pin each worker to one GPU before the process starts: EEVEE picks
-        # its device when the bpy module builds its GL context, so the
-        # restriction has to be in the environment, not set from Python.
+        # Round-robin CUDA_VISIBLE_DEVICES per worker. It must be set before
+        # the process starts, but EEVEE's EGL context ignores it (see the
+        # KNOWN LIMITATION above): every worker still renders on one GPU.
         gpu=$((worker_id % NUM_GPUS))
         CUDA_VISIBLE_DEVICES="$gpu" \
         python -m "$RENDERER" "${COMMON_ARGS[@]}" \
