@@ -84,7 +84,7 @@ These controls sit below either workflow:
 
 Each job lives under the configured project's local `outputs/` folder and contains a request, status, log, and result. Those generated files are excluded from Git and are not required to open the included demo scene.
 
-## Creatures, wings and other body plans
+## Creatures, robots and other body plans
 
 The model was trained on bipeds, quadrupeds, birds, insects and spiders, fish and sea creatures, snakes, and articulated objects such as robots, plants and machines. Rigs with many legs, wings, tails or no limbs at all work the same way as a human rig. These settings matter:
 
@@ -93,10 +93,10 @@ The model was trained on bipeds, quadrupeds, birds, insects and spiders, fish an
 | **Character** | **Human** for people (and the only choice that can use the Mixamo model). **Animal / Creature** for anything with legs, wings, fins or a tail that is a living thing: dogs, birds, spiders, crabs, dragons, snakes, fish. **Other articulated model** for robots, plants, cameras, arms and other objects. If a Human rig has more than two contact bones, **Check Rig** suggests Animal / Creature. |
 | **Rig faces** | The way the front of the body points (where the eyes look), even for a crab that walks sideways. |
 | **Contact bones** | The limb tips that touch the ground: feet, paws, claws, tarsi. Cleanup uses them to keep legs from sliding or sinking. Bones named *foot* or *paw* are found automatically. For other names (a spider's tarsus, a crab's dactyl, a dragon's claw) click **Detect** in the setup settings: it marks leaf bones that are at least three bones below the root, near the lowest point of the rig and off the body's midline, so tails, raised claws, wings and fins are left alone. Use **Mark** and **Unmark** on selected bones to correct it, and the **X** button to clear all marks. |
-| **Check Rig** | Reports how many contact bones it found. If there are none and **Motion cleanup** is on, ground contact cleanup is skipped and Check Rig says so. Flying, swimming and legless creatures (snakes, fish) have none, which is fine. |
+| **Check Rig** | Reports how many contact bones it found. If there are none and **Motion cleanup** is on, ground contact cleanup is skipped and Check Rig says so. Flying, swimming and legless creatures (snakes, fish) and rigs fixed in place (robot arms, plants) have none, which is fine; a quadruped robot's leg tips are found by **Detect**. |
 | **Joint limit** | The general model allows 71 joints. A spider with eight four-bone legs is 45 with terminal bones, a dragon with four legs and two wings about 50. Turn off **Animate terminal bones** if a large rig is over the limit. |
 
-Prompts work best when they name the creature and describe one action, in the plain style of the project's examples: "A dragon flaps its wings.", "A bird flaps its wings and takes off.", "A spider walks forward.", "A seaserpent sways its tail.", "A whale sweeps its tail.". For a take-off, a clip of the creature standing first and then a clip of it taking off gives the model a starting pose to leave from.
+Prompts work best when they name the creature and describe one action, in the plain style of the project's examples: "A dragon flaps its wings.", "A bird flaps its wings and takes off.", "A spider walks forward.", "A seaserpent sways its tail.", "A whale sweeps its tail.", "A quadruped robot walks forward.", "A robot arm pushes forward.", "A plant opens its mouth and bites forward.". For a take-off, a clip of the creature standing first and then a clip of it taking off gives the model a starting pose to leave from.
 
 Cleanup treats wings as part of the body for self-collision and does not know about air or water, so a creature that is meant to fly or swim will not be pushed to the ground; only the contact bones are kept above it.
 
@@ -108,7 +108,7 @@ Expand **Setup and generation settings** to configure the backend and less commo
 
 | Control | What it does |
 | --- | --- |
-| **Contact bones** | Shows how many bones count as ground contacts (feet, paws, claws, tarsi) after the last **Check Rig**. **Detect** marks limb tips that are not named foot or paw, **Mark** and **Unmark** change the selected bones, and **X** clears every mark. See [Creatures, wings and other body plans](#creatures-wings-and-other-body-plans). |
+| **Contact bones** | Shows how many bones count as ground contacts (feet, paws, claws, tarsi) after the last **Check Rig**. **Detect** marks limb tips that are not named foot or paw, **Mark** and **Unmark** change the selected bones, and **X** clears every mark. See [Creatures, wings and other body plans](#creatures-robots-and-other-body-plans). |
 | **Ground mesh** | Optional independent, non-deforming mesh used as a static contact surface when **Motion cleanup** is on. The add-on exports up to **20,000 triangles**. Leave it empty to use the rig's rest-sole level as a fallback plane. A visible ground plane is useful even when no mesh is assigned for cleanup, because it makes contact easier to inspect. |
 | **Animate terminal bones** | Enabled by default. Adds virtual endpoint joints to the exported skeleton so motion can reach terminal bones. These joints count toward the model's joint limit; turn this off if **Check Rig** reports too many joints. |
 | **Animate finger bones** | Enabled by default. Turn it off to leave finger and thumb bones (and their children) out of the export; they keep their rest pose. Bones are recognized by names such as *thumb*, *index*, *middle*, *ring* and *pinky*. A Mixamo character with fingers exports 52 bones (65 model joints with terminal bones), within the general model's 71. Without fingers it has 22 bones: 27 model joints with terminal bones, or exactly 22, the Mixamo model's skeleton, without them. |
