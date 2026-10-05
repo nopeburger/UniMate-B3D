@@ -203,6 +203,35 @@ def finish_motion(root, local, clips, skeleton, transition_frames, pose_approach
     return forward_kinematics(root, local, skeleton)
 
 
+def restore_references(positions, rotations, source_positions, source_rotations, frames, skeleton, falloff=12):
+    """Put captured reference poses back exactly after cleanup.
+
+    Each reference frame gets the source pose; the correction fades out over
+    up to falloff frames on either side, never reaching another reference.
+    """
+    from scipy.spatial.transform import Rotation
+    frames = sorted(set(frames))
+    if not frames:
+        return positions, rotations
+    parents = skeleton["parents"]
+    local, source = to_local(rotations, parents), to_local(source_rotations, parents)
+    root = positions[:, 0].copy()
+    count, joints = len(root), local.shape[1]
+    turns, shifts = np.zeros((count, joints, 3)), np.zeros((count, 3))
+    for index, frame in enumerate(frames):
+        gaps = [frame - frames[index-1]] if index else []
+        gaps += [frames[index+1] - frame] if index + 1 < len(frames) else []
+        reach = min([falloff] + [gap // 2 for gap in gaps])
+        turn = Rotation.from_matrix((source[frame] @ local[frame].swapaxes(-1, -2)).reshape(-1, 3, 3)).as_rotvec()
+        shift = source_positions[frame, 0] - positions[frame, 0]
+        for other in range(max(0, frame - reach), min(count, frame + reach + 1)):
+            weight = 1 - ease(abs(other - frame) / (reach + 1)) if reach else float(other == frame)
+            turns[other] += turn * weight
+            shifts[other] += shift * weight
+    local = Rotation.from_rotvec(turns.reshape(-1, 3)).as_matrix().reshape(count, joints, 3, 3) @ local
+    return forward_kinematics(root + shifts, local, skeleton)
+
+
 def retime(positions, rotations, spans, clips, skeleton,
            transition_frames=12, pose_approach_frames=60, seams=None):
     """Resample each clip's generated frames (spans) onto its frame range.

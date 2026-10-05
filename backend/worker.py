@@ -212,8 +212,18 @@ def generate(request, output, status):
     if request.get("motion_cleanup", True):
         from collision import cleanup
         write_status(status, "running", "Checking self-collisions, ground contact and joint limits")
+        source_positions, source_rotations = positions, rotations
         positions, rotations, collision_report = cleanup(
             positions, rotations, request["skeleton"], request.get("ground"))
+        # Captured references stay exact: cleanup may not move them.
+        if request.get("clips"):
+            from timeline import restore_references
+            frames, offset = [], 0
+            for clip in clips:
+                frames += [offset + ref["frame"] - clip["start"] for ref in clip.get("references", [])]
+                offset += clip["end"] - clip["start"] + 1
+            positions, rotations = restore_references(positions, rotations, source_positions,
+                                                      source_rotations, frames, request["skeleton"])
     temp = output.with_suffix(".tmp")
     with temp.open("wb") as handle:
         np.savez_compressed(handle, schema=1, positions=positions, rotations=rotations,
