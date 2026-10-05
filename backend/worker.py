@@ -128,6 +128,7 @@ def generate(request, output, status):
     from unimate.configs.schema import MainConfig
     from unimate.models.flow.transport import Sampler
     from unimate.inference.generate import generate_samples
+    from timeline import pin_root
     from timeline import constraints, plan_windows, retime
     if request.get("schema") != 1 or not request["prompt"].strip():
         raise ValueError("A valid request and a non-empty prompt are required.")
@@ -199,6 +200,8 @@ def generate(request, output, status):
     if not request.get("clips"):
         features = features[:frames]
     positions, rotations = load_geometry().decode_features(features, canonical)
+    if request.get("fixed_base"):
+        positions, rotations = pin_root(positions, rotations, request["skeleton"])
     if request.get("clips"):
         positions, rotations = retime(positions, rotations, spans, clips, request["skeleton"],
                                      request.get("transition_frames", 12),

@@ -35,6 +35,8 @@ class UniMateSettings(bpy.types.PropertyGroup):
         description="Optional static surface for foot and paw contact; otherwise use the rest sole level")
     motion_cleanup: BoolProperty(name="Motion cleanup", default=True,
         description="Correct self-collisions, ground contact and extreme foot/paw rotations; intersecting reference poses may be adjusted")
+    fixed_base: BoolProperty(name="Fixed base", default=False,
+        description="Keep the root bone where it is and animate only rotations, for plants, robot arms and machines fixed to the floor or a wall. Otherwise the model's root travel and bobbing slide or hop the whole rig")
     overlap: IntProperty(name="Transition context", default=10, min=1, max=30)
     transition_frames: IntProperty(name="Prompt blend frames", default=12, min=0, max=120, description="Smooth joins between generated prompt clips; zero disables")
     pose_approach_frames: IntProperty(name="Pose approach frames", default=60, min=0, max=600, description="Ease into captured reference poses over this many frames within their clip; replaces motion in that approach with a pose blend; zero disables")
@@ -320,7 +322,7 @@ class UNIMATE_OT_generate(bpy.types.Operator):
             request = dict(schema=1, skeleton=skeleton, prompt=settings.prompt.strip(),
                            experiment=str(exp), stats_family=settings.family, frames=settings.frames,
                            fps=settings.fps, seed=settings.seed, guidance=settings.guidance,
-                           motion_cleanup=settings.motion_cleanup,
+                           motion_cleanup=settings.motion_cleanup, fixed_base=settings.fixed_base,
                            ground=export_ground(rig, skeleton, settings.ground_object) if settings.motion_cleanup else None)
             if settings.mode == "TIMELINE":
                 request.update(clips.collect_schedule(settings, skeleton, context.scene))
@@ -435,6 +437,7 @@ class UNIMATE_PT_main(bpy.types.Panel):
             row.prop(settings, "seed")
             layout.prop(settings, "start_frame")
         layout.prop(settings, "motion_cleanup")
+        layout.prop(settings, "fixed_base")
         if _job:
             layout.operator("unimate.cancel", icon="CANCEL")
         else:

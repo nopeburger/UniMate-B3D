@@ -58,6 +58,17 @@ def constraints(previous, slots, shape, overlap, mean, std, device):
         mask[0, :len(mean), :9, slot] = True
     return known, mask
 
+def pin_root(positions, rotations, skeleton):
+    """Keep the root at its rest position for every frame; only rotations animate.
+
+    For plants, robot arms and machines fixed to the floor or a wall, where the
+    model's root travel and bobbing would slide or hop the whole rig.
+    """
+    local = to_local(rotations, skeleton["parents"])
+    root = np.tile(np.asarray(skeleton["heads"][0], dtype=float), (len(positions), 1))
+    return forward_kinematics(root, local, skeleton)
+
+
 def to_local(rotations, parents):
     local = rotations.copy()
     for j, parent in enumerate(parents[1:], 1):
