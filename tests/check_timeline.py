@@ -7,7 +7,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/"backend"))
-from timeline import retime, forward_kinematics, to_local, native_index
+from timeline import retime, forward_kinematics, to_local, native_index, smooth_motion
 spec = importlib.util.spec_from_file_location("geometry", ROOT/"addon/unimate_motion/motion.py")
 geo = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(geo)
@@ -114,10 +114,33 @@ plan_windows([dict(start=1,end=600,references=[dict(frame=301),dict(frame=305)])
 # retime maps references through the same native index for chained spans.
 chained=[dict(start=1,end=180,references=[dict(frame=90)])]
 assert native_index(chained[0],chained[0]["references"][0],160)==79
+# Smoothing: 0 is the identity; otherwise rough rotations calm down and bone lengths hold.
+_rng=np.random.default_rng(3)
+_sk=dict(parents=[-1,0,1],heads=[[0,0,0],[0,.5,0],[0,1,0]])
+_loc=np.tile(np.eye(3),(40,3,1,1))
+_loc[:,1:]=Rotation.from_rotvec(_rng.normal(0,.3,(80,3))).as_matrix().reshape(40,2,3,3)
+_root=np.zeros((40,3))
+_p,_r=forward_kinematics(_root,_loc,_sk)
+_p0,_r0=smooth_motion(_p,_r,_sk,0)
+assert _p0 is _p and _r0 is _r
+_ps,_rs=smooth_motion(_p,_r,_sk,2.0)
+assert np.abs(np.diff(_ps,2,axis=0)).mean()<np.abs(np.diff(_p,2,axis=0)).mean()*.5
+assert np.allclose(np.linalg.norm(_ps[:,1]-_ps[:,0],axis=-1),.5,atol=1e-5)
+# Contact limbs keep most of their swing; the rest of the body is smoothed harder.
+_sk2=dict(parents=[-1,0,1,2],heads=[[0,0,0],[0,.5,0],[0,1,0],[0,1.5,0]],foot_profiles=[dict(joint=3,parent=2,upper=1)])
+_t=np.arange(60)
+_swing=Rotation.from_rotvec(np.stack([np.sin(_t*.9)*.6,0*_t,0*_t],1)).as_matrix()   # fast swing, 7 frames per cycle
+_loc2=np.tile(np.eye(3),(60,4,1,1)); _loc2[:,1]=_swing; _loc2[:,3]=_swing
+_p2,_r2=forward_kinematics(np.zeros((60,3)),_loc2,_sk2)
+_ps2,_rs2=smooth_motion(_p2,_r2,_sk2,3.0)
+_free=dict(_sk2,foot_profiles=[])
+_pu,_ru=smooth_motion(_p2,_r2,_free,3.0)
+_amp=lambda p:np.ptp(p[10:-10,3]-p[10:-10,0],axis=0).max()
+assert _amp(_ps2)>_amp(_pu)*1.5 and _amp(_ps2)>_amp(_p2)*.5
 report=dict(passed=["window joins smoothed","reference exits smoothed","window planning","chained reference slots","exact reference frame","earlier prompt preserved","no sit rotation spike",
                     "no endpoint root snap","FK bone lengths","disable editing",
                     "multiple and first-frame references","interior reference release",
-                    "short and stretched clips"],
+                    "short and stretched clips","motion smoothing","limbs keep their swing"],
             approach_max_degrees=float(step[59:].max()))
 (ROOT/"tests/artifacts/timeline-regressions.json").write_text(json.dumps(report,indent=2))
 print(json.dumps(report,indent=2))
