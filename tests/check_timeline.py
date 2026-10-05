@@ -59,7 +59,14 @@ for duration in [2,60,300]:
     pp,rr=retime(raw_pos,raw_rot,[(0,60),(60,110)],plain,skel,12,0)
     assert len(pp)==60+duration
     fixed_offsets(pp,rr)
-    assert np.allclose(rr[60],rr[59],atol=1e-8)
+    # The join continues the previous clip's motion: no frozen frame (the old
+    # blend repeated the last pose) and no jump in rotation or root speed.
+    def turn(a,b):
+        return np.degrees(Rotation.from_matrix((a.swapaxes(-1,-2)@b).reshape(-1,3,3)).magnitude())
+    before,at=turn(rr[58],rr[59]),turn(rr[59],rr[60])
+    assert np.abs(at-before).max()<1.5, ("Join changes rotation speed", np.abs(at-before).max())
+    v_before,v_at=pp[59,0]-pp[58,0],pp[60,0]-pp[59,0]
+    assert np.linalg.norm(v_at-v_before)<.2*np.linalg.norm(v_before)+1e-4, "Join changes root speed"
 # Window planning: one window reproduces the old single-window mapping; long
 # clips chain windows and keep each reference on its proportional frame.
 from timeline import plan_windows, native_index

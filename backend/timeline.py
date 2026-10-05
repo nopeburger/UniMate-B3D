@@ -123,14 +123,25 @@ def finish_motion(root, local, clips, skeleton, transition_frames, pose_approach
             end = min(end, cursor+refs[0]["frame"]-clip["start"])
         if cursor and end > cursor:
             n = end-cursor
-            rot_error = Rotation.from_matrix(local[cursor-1] @ local[cursor].swapaxes(-1,-2)).as_rotvec()
-            root_error = root[cursor-1]-root[cursor]
-            root_velocity = root[cursor-1]-root[cursor-2] if cursor > 1 else np.zeros(3)
+            def step(a, b):  # per-joint rotation taking b to a, as rotation vectors
+                return Rotation.from_matrix((a @ b.swapaxes(-1,-2)).reshape(-1,3,3)).as_rotvec()
+            previous_spin = step(local[cursor-1], local[cursor-2]) if cursor > 1 else np.zeros((local.shape[1], 3))
+            extrapolated = Rotation.from_rotvec(previous_spin).as_matrix() @ local[cursor-1]
+            rot_error = step(extrapolated, local[cursor])
+            spin_error = previous_spin-step(local[cursor+1], local[cursor])
+            # Inertialization: decay the position and velocity gaps between the
+            # previous clip (extrapolated one frame) and the new one. Adding the
+            # whole previous velocity instead of the gap double-counted motion:
+            # the hips lurched to old + new speed, then stopped hard.
+            previous_velocity = root[cursor-1]-root[cursor-2] if cursor > 1 else np.zeros(3)
+            next_velocity = root[cursor+1]-root[cursor]
+            root_error = root[cursor-1]+previous_velocity-root[cursor]
+            velocity_error = previous_velocity-next_velocity
             for t in range(n):
                 u = t/n
                 weight = 1-ease(u)
-                local[cursor+t] = Rotation.from_rotvec(rot_error*weight).as_matrix() @ local[cursor+t]
-                root[cursor+t] += root_error*weight + root_velocity*(t+1)*weight
+                local[cursor+t] = Rotation.from_rotvec((rot_error+spin_error*t)*weight).as_matrix() @ local[cursor+t]
+                root[cursor+t] += (root_error + velocity_error*t)*weight
         # Each reference is approached from an earlier pose with zero endpoint speed.
         # Local rotations avoid collapsing limbs as their parents turn.
         previous_ref = cursor-1 if cursor else 0
