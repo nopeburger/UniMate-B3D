@@ -37,6 +37,16 @@ class UniMateSettings(bpy.types.PropertyGroup):
         description="Smooth the generated motion over time, in frames. Calms jitter and fast head or limb jerks that some non-human rigs get (dragons, long necks) at the cost of some sharpness; 1.5 to 2.5 is a good start. 0 leaves the motion as generated")
     motion_cleanup: BoolProperty(name="Motion cleanup", default=True,
         description="Correct self-collisions, ground contact and extreme foot/paw rotations; intersecting reference poses may be adjusted")
+    self_collision: EnumProperty(name="Self-collision", default="auto", items=[
+        ("auto", "Auto", "Keep limbs from passing through the body; off for rigs with five or more contact bones"),
+        ("on", "On", "Always push colliding parts apart"),
+        ("off", "Off", "Leave limbs as generated")],
+        description="Cleanup pushes limbs out of each other. With many legs this rearranges the gait and crosses the legs, so Auto leaves rigs with five or more contact bones (spiders, crabs, insects) as generated")
+    plant_feet: EnumProperty(name="Plant feet", default="auto", items=[
+        ("auto", "Auto", "Hold planted feet in place; off for rigs with five or more contact bones"),
+        ("on", "On", "Always hold planted feet"),
+        ("off", "Off", "Only lift the body onto the ground")],
+        description="Cleanup holds planted feet still to stop sliding. With many legs this bends the legs across each other, so Auto leaves rigs with five or more contact bones as generated; the body is still lifted onto the ground")
     settle_to_ground: BoolProperty(name="Settle on ground", default=True,
         description="Lower the motion until its lowest contact bone touches the ground, if it never does. The model sometimes leaves a walking robot or animal hovering; turn off for creatures meant to fly or hover")
     overlap: IntProperty(name="Transition context", default=10, min=1, max=30)
@@ -325,6 +335,7 @@ class UNIMATE_OT_generate(bpy.types.Operator):
                            experiment=str(exp), stats_family=settings.family, frames=settings.frames,
                            fps=settings.fps, seed=settings.seed, guidance=settings.guidance,
                            motion_cleanup=settings.motion_cleanup, settle_to_ground=settings.settle_to_ground, smoothing=settings.smoothing,
+                           self_collision=settings.self_collision, plant_feet=settings.plant_feet,
                            ground=export_ground(rig, skeleton, settings.ground_object) if settings.motion_cleanup else None)
             if settings.mode == "TIMELINE":
                 request.update(clips.collect_schedule(settings, skeleton, context.scene))
@@ -454,6 +465,8 @@ class UNIMATE_PT_main(bpy.types.Panel):
             layout.prop(settings, "tips")
             layout.prop(settings, "fingers")
             layout.prop(settings, "settle_to_ground")
+            layout.prop(settings, "self_collision")
+            layout.prop(settings, "plant_feet")
             layout.prop(settings, "guidance")
             layout.prop(settings, "fps")
             layout.prop(settings, "overlap")

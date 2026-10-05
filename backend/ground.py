@@ -550,7 +550,7 @@ def evaluate(positions,rotations,feet,surface,windows,anchors):
                 max_anchor_error=float(max(errors)) if errors else 0.,
                 unresolved_contact_frames=unresolved)
 
-def plant(positions,rotations,skeleton,ground,settle=True):
+def plant(positions,rotations,skeleton,ground,settle=True,anchor=True):
     profiles=profiles_for(skeleton)
     feet=foot_capsules(skeleton,profiles)
     if not feet:
@@ -594,7 +594,10 @@ def plant(positions,rotations,skeleton,ground,settle=True):
     before_steps=[np.linalg.norm(np.diff(item["soles"][s:e],axis=0),axis=1)
                   for item,segments in zip(before,windows) for s,e in segments if e-s>1]
     source_positions=pos.copy()
-    pos,rot,anchors,active=solve_contacts(pos,rot,skeleton,feet,surface,windows)
+    if anchor:
+        pos,rot,anchors,active=solve_contacts(pos,rot,skeleton,feet,surface,windows)
+    else:  # keep the generated legs; the body lift and settling above still put them on the ground
+        anchors,active={},0
     pos,rot,bend_corrections=preserve_bend(pos,rot,source_positions,skeleton,feet)
     metrics=evaluate(pos,rot,feet,surface,windows,anchors)
     report=dict(method="ground contact with limb IK",ground=ground.get("object","rest sole plane"),
