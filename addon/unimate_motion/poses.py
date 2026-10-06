@@ -1,6 +1,7 @@
 """Editable human landmark mapping and pose capture for UniMate conditioning."""
 import json
 import re
+import bpy
 import numpy as np
 from mathutils import Matrix, Vector
 from .motion import canonicalize, encode_pose, semantic_name
@@ -30,8 +31,8 @@ def auto_mapping(rig):
         mapping[role] = matches[0] if len(matches) == 1 else ""
     return mapping
 
-def capture_pose(rig, skeleton):
-    """Read the current pose in armature space and encode it with encode_pose."""
+def pose_arrays(rig, skeleton):
+    """Read the current pose of the rig as (positions, rotations) in the skeleton's export frame."""
     parents = skeleton["parents"]
     count = len(parents)
     positions = np.zeros((count, 3))
@@ -53,7 +54,32 @@ def capture_pose(rig, skeleton):
     if linear is not rotation:  # armature space -> export frame
         positions = positions @ linear.T
         rotations = rotation @ rotations @ rotation.T
-    return encode_pose(positions, rotations, skeleton)
+    return positions, rotations
+
+def capture_pose(rig, skeleton):
+    """Read the current pose in armature space and encode it with encode_pose."""
+    return encode_pose(*pose_arrays(rig, skeleton), skeleton)
+
+def capture_motion(rig, skeleton, scene, start, end):
+    """Evaluate the rig's animation on every frame of start..end and return (positions, rotations).
+
+    The scene's current frame is restored afterwards.
+    """
+    original = scene.frame_current
+    positions, rotations = [], []
+    try:
+        for frame in range(start, end + 1):
+            scene.frame_set(frame)
+            bpy.context.view_layer.update()
+            try:
+                p, r = pose_arrays(rig, skeleton)
+            except ValueError as exc:
+                raise ValueError(f"Frame {frame}: {exc}") from None
+            positions.append(p)
+            rotations.append(r)
+    finally:
+        scene.frame_set(original)
+    return np.stack(positions), np.stack(rotations)
 
 def preview_estimate(rig, skeleton, estimate, mapping, threshold=.5):
     canon = canonicalize(skeleton)

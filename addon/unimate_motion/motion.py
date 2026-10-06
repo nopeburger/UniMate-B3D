@@ -99,6 +99,25 @@ def decode_features(features, canonical):
     return positions, rotations
 
 
+def encode_motion(positions, rotations, skeleton):
+    """Encode a whole motion as UniMate features, the inverse of decode_features.
+
+    positions (frames, joints, 3) and rotations (frames, joints, 3, 3) are in the skeleton's
+    export frame. The root's travel becomes the velocity channels of joint 0, so a motion
+    decodes back to the same path.
+    """
+    positions, rotations = np.asarray(positions, dtype=float), np.asarray(rotations, dtype=float)
+    canon = canonicalize(skeleton)
+    features = np.stack([np.asarray(encode_pose(p, r, skeleton)["features"]) for p, r in zip(positions, rotations)])
+    root = (positions[:, 0] @ canon["basis"].T - canon["origin"]) * canon["scale"]
+    step = np.diff(root, axis=0)
+    facing = rotation_6d(features[:, 0, 3:9])
+    # decode_features: root[t+1] - root[t] = facing[t+1].T @ (vx, 0, vz), with (vx, vz) stored on frame t.
+    velocity = np.einsum("tij,tj->ti", facing[1:], step)
+    features[:-1, 0, 9] = velocity[:, 0]
+    features[:-1, 0, 11] = velocity[:, 2]
+    return features
+
 def encode_pose(positions, rotations, skeleton):
     """Capture a static pose as UniMate features (root travel is not constrained)."""
     canon = canonicalize(skeleton)

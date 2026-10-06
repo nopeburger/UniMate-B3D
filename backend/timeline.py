@@ -58,6 +58,69 @@ def constraints(previous, slots, shape, overlap, mean, std, device):
         mask[0, :len(mean), :9, slot] = True
     return known, mask
 
+def edit_mask(parents, regenerate):
+    """Which feature entries stay pinned to the existing motion when some bones are regenerated.
+
+    regenerate lists joint indices; their descendants are regenerated with them. Returns
+    (keep, regenerated) with keep a (joints, 12) bool array. Slot j of a motion holds joint j's
+    position (channels 0:3) and its PARENT's rotation (3:9), so a rotation is pinned only
+    when its owner is kept; the root slot (facing and velocity) is always pinned.
+    """
+    count = len(parents)
+    regenerated = set(int(j) for j in regenerate)
+    if 0 in regenerated:
+        raise ValueError("The root cannot be regenerated; keep it and select the bones to change.")
+    if any(not 0 < j < count for j in regenerated):
+        raise ValueError("Unknown joint to regenerate.")
+    for joint, parent in enumerate(parents):
+        if parent in regenerated:
+            regenerated.add(joint)
+    if len(regenerated) >= count - 1:
+        raise ValueError("Keep at least one bone besides the root; regenerating everything is the normal workflow.")
+    keep = np.zeros((count, 12), dtype=bool)
+    for joint in range(count):
+        keep[joint, 0:3] = joint not in regenerated
+        keep[joint, 3:9] = joint == 0 or parents[joint] not in regenerated
+    keep[0, 9:12] = True
+    return keep, sorted(regenerated)
+
+
+def edit_windows(frames, window, overlap):
+    """Number of chained model windows needed to cover `frames` frames one-to-one."""
+    step = window - overlap
+    return 1 + max(0, -(-(frames - window) // step))
+
+
+def edit_window(normalized, keep, start, window, first_slot):
+    """Known values and pin mask for one model window of an edit.
+
+    normalized is the existing motion's normalized features (frames, joints, 12); the window
+    covers motion frames start..start+window-1 (the last frame repeats past the end). Slots
+    before first_slot belong to the previous window and are left to it. Returns arrays shaped
+    (joints, 12, window).
+    """
+    frames = len(normalized)
+    known = np.zeros((normalized.shape[1], 12, window), dtype=np.float32)
+    mask = np.zeros(known.shape, dtype=bool)
+    for slot in range(first_slot, window):
+        known[:, :, slot] = normalized[min(start + slot, frames - 1)]
+        mask[:, :, slot] = keep
+    return known, mask
+
+
+def restore_kept(positions, rotations, source_positions, source_rotations, regenerated, skeleton):
+    """Put every bone that was not regenerated back exactly as authored, and the root path too.
+
+    Cleanup after an edit may nudge any bone; the bones the user chose to keep must not change.
+    """
+    parents = skeleton["parents"]
+    local, source = to_local(rotations, parents), to_local(source_rotations, parents)
+    kept = [j for j in range(1, len(parents)) if j not in set(regenerated)]
+    local[:, kept] = source[:, kept]
+    local[:, 0] = source[:, 0]
+    return forward_kinematics(source_positions[:, 0], local, skeleton)
+
+
 def pin_root(positions, rotations, skeleton):
     """Keep the root at its rest position for every frame; only rotations animate.
 

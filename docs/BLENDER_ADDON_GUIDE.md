@@ -76,6 +76,27 @@ References belong to the selected prompt clip. They target **poses at particular
 
 The captured target constrains joint rotations, root height and the facing direction at its frame while letting the model generate horizontal movement. Capture the pose facing the way the character should face at that frame; for example, after a clip that turns the character around, a target captured in the rest orientation turns it back. A target pose that intersects the character or ground can be adjusted by **Motion cleanup**. If exact captured rotations matter more, turn cleanup off and review collisions yourself. The estimator and preview do not guarantee a physically plausible transition; adjust **Pose approach frames** and inspect the resulting Action.
 
+## Regenerate selected bones
+
+Keep most of an animation and let the model redo part of it: for example keep the legs and the walk, and ask for the arms to wave. Animate the rig as usual, then in the **Prompt timeline**:
+
+1. Keep a single prompt clip that covers the frames you want to change, and describe the new motion ("A person waves with both hands.").
+2. Enter Pose Mode and select the bones to regenerate. Bones below them regenerate too, so selecting an upper arm takes the forearm and hand with it.
+3. Turn on **Regenerate selected bones** (the panel shows how many bones are selected) and click **Generate Motion**, then **Apply Motion**.
+
+The model sees the bones you did not select as fixed, frame for frame, and generates the rest to match, so the new motion fits the body that stays. In a test, a generated walk had its right shoulder and arm regenerated from "A human waves with the right hand.": every other bone came back unchanged (under 0.1°) and the root path within a millionth of a metre, while the right hand rose to about head height in roughly half the frames as the character kept walking. Apply creates a new Action; your keyed one is left as it was.
+
+Things to know:
+
+- Select the first bone of the chain you want to change, because only the bones below it are regenerated: the shoulder (clavicle) to move a whole arm, not the upper arm. Selecting only the upper arm leaves the shoulder fixed, and the arm tends to stay low.
+- Raise **Text guidance** to about 5–7. At the default 3 the regenerated bones often stay close to the kept motion; in the wave test, guidance 3 only bent the elbow while guidance 6 lifted the hand.
+- Describe the motion of the regenerated part, using the training captions' wording ("A human waves with the right hand.").
+- The rig needs an Action, and the root bone cannot be regenerated. Select limbs, the spine or the head instead. Selecting nearly everything is the same as generating from scratch, and is refused.
+- The clip can be up to 600 frames and keeps its length; the motion is not retimed. Pose references cannot be used in the same clip, because the kept bones already pin the motion.
+- Only rotations and root movement are read from your Action. Bone scale or non-root translation is reported with the frame where it was found.
+- **Motion smoothing** and **Fixed base** do not apply. Motion cleanup still runs, but afterwards every kept bone and the root are put back exactly as you keyed them.
+- Leaf bones (a hand with nothing below it, a tail tip) have no rotation of their own in the model's data, so they follow their parent.
+
 ## Generation and cleanup
 
 These controls sit below either workflow:
