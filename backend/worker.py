@@ -170,7 +170,7 @@ def generate(request, output, status):
         clip_request = dict(request, prompt=clip["prompt"])
         shape, cond, canonical, mean, std = build_condition(clip_request, config, encoder, stats, device)
         conditions.append(cond)
-    overlap = int(request.get("overlap", 10))
+    overlap = int(request.get("overlap", 20))
     if not 1 <= overlap < shape[-1]-1:
         raise ValueError("Transition context must be smaller than the model window.")
     edit = request.get("edit")

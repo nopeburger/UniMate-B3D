@@ -55,7 +55,8 @@ class UniMateSettings(bpy.types.PropertyGroup):
         description="Cleanup holds planted feet still to stop sliding. With many legs this bends the legs across each other, so Auto leaves rigs with five or more contact bones as generated; the body is still lifted onto the ground")
     settle_to_ground: BoolProperty(name="Settle on ground", default=True,
         description="Lower the motion until its lowest contact bone touches the ground, if it never does. The model sometimes leaves a walking robot or animal hovering; turn off for creatures meant to fly or hover")
-    overlap: IntProperty(name="Transition context", default=10, min=1, max=30)
+    overlap: IntProperty(name="Transition context", default=20, min=1, max=30,
+        description="Model frames of the previous window given to the next one as context. With 10, a walk slowed at the start of each new window; 20 keeps the pace. Larger values need more windows for long clips")
     transition_frames: IntProperty(name="Prompt blend frames", default=12, min=0, max=120, description="Smooth joins between generated prompt clips; zero disables")
     pose_approach_frames: IntProperty(name="Pose approach frames", default=60, min=0, max=600, description="Ease into captured reference poses over this many frames within their clip; replaces motion in that approach with a pose blend; zero disables")
     rig: PointerProperty(name="Rig", type=bpy.types.Object, poll=lambda self, obj: obj.type == "ARMATURE")
