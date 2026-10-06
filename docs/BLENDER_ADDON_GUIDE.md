@@ -84,10 +84,13 @@ Keep most of an animation and let the model redo part of it: for example keep th
 2. Enter Pose Mode and select the bones to regenerate. Bones below them regenerate too, so selecting an upper arm takes the forearm and hand with it.
 3. Turn on **Regenerate selected bones** (the panel shows how many bones are selected) and click **Generate Motion**, then **Apply Motion**.
 
-The model sees the bones you did not select as fixed, frame for frame, and generates the rest to match, so the new motion fits the body that stays. In a test, with the arms of a walking character regenerated, every other bone and the root path came back unchanged (under 0.05°, and within a millionth of a metre of the keyed root path) while the arms moved by 37–110°. Apply creates a new Action; your keyed one is left as it was.
+The model sees the bones you did not select as fixed, frame for frame, and generates the rest to match, so the new motion fits the body that stays. In a test, a generated walk had its right shoulder and arm regenerated from "A human waves with the right hand.": every other bone came back unchanged (under 0.1°) and the root path within a millionth of a metre, while the right hand rose to about head height in roughly half the frames as the character kept walking. Apply creates a new Action; your keyed one is left as it was.
 
 Things to know:
 
+- Select the first bone of the chain you want to change, because only the bones below it are regenerated: the shoulder (clavicle) to move a whole arm, not the upper arm. Selecting only the upper arm leaves the shoulder fixed, and the arm tends to stay low.
+- Raise **Text guidance** to about 5–7. At the default 3 the regenerated bones often stay close to the kept motion; in the wave test, guidance 3 only bent the elbow while guidance 6 lifted the hand.
+- Describe the motion of the regenerated part, using the training captions' wording ("A human waves with the right hand.").
 - The rig needs an Action, and the root bone cannot be regenerated. Select limbs, the spine or the head instead. Selecting nearly everything is the same as generating from scratch, and is refused.
 - The clip can be up to 600 frames and keeps its length; the motion is not retimed. Pose references cannot be used in the same clip, because the kept bones already pin the motion.
 - Only rotations and root movement are read from your Action. Bone scale or non-root translation is reported with the frame where it was found.
