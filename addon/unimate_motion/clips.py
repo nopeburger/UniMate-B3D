@@ -120,7 +120,8 @@ class UNIMATE_OT_import_posecode(bpy.types.Operator, ImportHelper):
                 raise ValueError(
                     f"Set the Blender scene to {manifest_fps} FPS before importing this Posecode manifest."
                 )
-            if settings.clips and not self.overwrite_confirmed:
+            # Background Blender (scripts, tests) cannot show a dialog; opening one crashes it.
+            if settings.clips and not self.overwrite_confirmed and not bpy.app.background:
                 self.overwrite_confirmed = True
                 return context.window_manager.invoke_props_dialog(
                     self,
