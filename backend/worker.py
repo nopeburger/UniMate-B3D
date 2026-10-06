@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("HF_HOME", str(ROOT / "cache" / "huggingface"))
 # Upstream Friedrich-M/UniMate commit merged into unimate/; update after each upstream merge.
-UPSTREAM_COMMIT = "2c5b384715aa63d8639b1ed7eb74bfe614570c7a"
+UPSTREAM_COMMIT = "2f605cd4763449b05a69ef0f8afc826b99ad4dea"
 
 def load_geometry():
     spec = importlib.util.spec_from_file_location("unimate_geometry", ROOT / "addon" / "unimate_motion" / "motion.py")
@@ -23,7 +23,16 @@ def load_geometry():
     spec.loader.exec_module(module)
     return module
 
+MAX_TAKES = 8
+_status_prefix = [""]  # "Take 2/4: " while a multi-take job runs
+
+def take_output(output, take):
+    """Result file of a take: take 1 keeps motion.npz, later ones are motion_take2.npz and so on."""
+    output = Path(output)
+    return output if take == 1 else output.with_name(f"{output.stem}_take{take}{output.suffix}")
+
 def write_status(path, state, message):
+    message = _status_prefix[0] + message if state == "running" else message
     temp = path.with_suffix(".tmp")
     temp.write_text(json.dumps({"state": state, "message": message}), encoding="utf-8")
     temp.replace(path)
@@ -285,13 +294,30 @@ def generate(request, output, status):
         warnings.append(f"{collision_report['ground_contact']['unresolved_contact_frames']} uncertain contact frames")
     if warnings:
         message += " (review: " + ", ".join(warnings) + ")"
-    write_status(status, "complete", message)
+    return message
 
 def run_job(request_path, output, status):
+    """Run one request. With "takes" > 1, generate that many takes with consecutive seeds."""
     try:
         request = json.loads(Path(request_path).read_text(encoding="utf-8"))
-        generate(request, Path(output), Path(status))
+        takes = int(request.get("takes", 1))
+        if not 1 <= takes <= MAX_TAKES:
+            raise ValueError(f"Choose 1 to {MAX_TAKES} takes.")
+        seed = int(request["seed"])
+        messages = []
+        for take in range(1, takes + 1):
+            _status_prefix[0] = f"Take {take}/{takes}: " if takes > 1 else ""
+            messages.append(generate(dict(request, seed=seed + take - 1), take_output(output, take), Path(status)))
+        _status_prefix[0] = ""
+        if takes == 1:
+            message = messages[0]
+        else:
+            review = sum("review" in m for m in messages)
+            message = (f"{takes} takes ready (seeds {seed}-{seed + takes - 1}) — Apply Motion creates one Action per take"
+                       + (f"; {review} need review" if review else ""))
+        write_status(Path(status), "complete", message)
     except Exception as exc:
+        _status_prefix[0] = ""
         traceback.print_exc()
         write_status(Path(status), "failed", f"{type(exc).__name__}: {exc}")
         return 1
