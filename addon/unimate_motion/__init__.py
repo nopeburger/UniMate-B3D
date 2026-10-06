@@ -79,6 +79,12 @@ class UniMateSettings(bpy.types.PropertyGroup):
     frames: IntProperty(name="Frames", default=60, min=2, max=60)
     fps: FloatProperty(name="Motion FPS", default=30, min=1, max=120, description="Playback interpretation; the source training clips use varying frame rates")
     seed: IntProperty(name="Seed", default=10, min=0)
+    takes: IntProperty(name="Takes", default=1, min=1, max=8,
+        description="Generate this many takes in one go, with consecutive seeds. Results vary a lot by seed; "
+                    "Apply Motion creates one Action per take so you can compare them")
+    take: IntProperty(name="Take", default=1, min=1, max=8, update=lambda self, context: show_take(self, context),
+        description="Which take of the last applied generation the rig plays")
+    applied_takes: IntProperty(default=0)
     guidance: FloatProperty(name="Text guidance", default=3, min=1.01, max=20)
     extend_clips: BoolProperty(name="Generate long clips in full", default=True,
         description="Chain extra model windows so clips longer than 60 frames get new motion; off stretches one window over the clip")
@@ -414,7 +420,7 @@ class UNIMATE_OT_generate(bpy.types.Operator):
             folder.mkdir(parents=True)
             request = dict(schema=1, skeleton=skeleton, prompt=settings.prompt.strip(),
                            experiment=str(exp), stats_family=settings.family, frames=settings.frames,
-                           fps=settings.fps, seed=settings.seed, guidance=settings.guidance,
+                           fps=settings.fps, seed=settings.seed, takes=settings.takes, guidance=settings.guidance,
                            motion_cleanup=settings.motion_cleanup, fixed_base=settings.fixed_base, settle_to_ground=settings.settle_to_ground, smoothing=settings.smoothing,
                            self_collision=settings.self_collision, plant_feet=settings.plant_feet,
                            ground=export_ground(rig, skeleton, settings.ground_object) if settings.motion_cleanup else None)
@@ -478,6 +484,34 @@ class UNIMATE_OT_unload(bpy.types.Operator):
         refresh()
         return {"FINISHED"}
 
+def take_files(folder):
+    """Result files of a job in take order: motion.npz, then motion_take2.npz, motion_take3.npz..."""
+    files = [Path(folder) / "motion.npz"]
+    take = 2
+    while (Path(folder) / f"motion_take{take}.npz").is_file():
+        files.append(Path(folder) / f"motion_take{take}.npz")
+        take += 1
+    return files
+
+def use_action(rig, action):
+    animation = rig.animation_data or rig.animation_data_create()
+    animation.action = action
+    slots = getattr(action, "slots", None)
+    if slots and getattr(animation, "action_slot", None) is None:
+        animation.action_slot = slots[0]
+
+def show_take(settings, context):
+    """Switch the rig to another take of the last applied job."""
+    rig = selected_rig(context)
+    if rig is None or not settings.job_dir:
+        return
+    for action in bpy.data.actions:
+        if action.get("unimate_job") == str(Path(settings.job_dir)) and action.get("unimate_take") == settings.take:
+            use_action(rig, action)
+            settings.status = f"Playing take {settings.take}: {action.name}"
+            return
+    settings.status = f"Take {settings.take} has not been applied"
+
 class UNIMATE_OT_apply(bpy.types.Operator):
     bl_idname = "unimate.apply"
     bl_label = "Apply Motion"
@@ -497,9 +531,22 @@ class UNIMATE_OT_apply(bpy.types.Operator):
                 fps = context.scene.render.fps / context.scene.render.fps_base
                 if abs(fps - request["fps"]) > .001:
                     raise ValueError("Scene FPS changed since timeline generation; restore it before applying.")
-            action = apply_result(selected_rig(context), request["skeleton"], folder / "motion.npz",
-                                  start, context.scene)
-            settings.status = f"Created Action: {action.name}"
+            rig = selected_rig(context)
+            files = take_files(folder)
+            actions = []
+            for take, path in enumerate(files, 1):
+                action = apply_result(rig, request["skeleton"], path, start, context.scene)
+                action["unimate_job"], action["unimate_take"] = str(folder), take
+                if len(files) > 1:
+                    action.name = f"{action.name} | take {take}"
+                actions.append(action)
+            settings.applied_takes = len(actions)
+            if len(actions) > 1:
+                use_action(rig, actions[0])
+                settings["take"] = 1   # without triggering the update, which would re-assign the same Action
+                settings.status = f"Created {len(actions)} Actions, one per take; take 1 is playing. Use Take to compare"
+            else:
+                settings.status = f"Created Action: {actions[0].name}"
             self.report({"INFO"}, settings.status)
             return {"FINISHED"}
         except Exception as exc:
@@ -522,7 +569,9 @@ class UNIMATE_PT_main(bpy.types.Panel):
         layout.prop(settings, "mode", text="")
         if settings.mode == "TIMELINE":
             clips.draw_timeline(layout, context)
-            layout.prop(settings, "seed")
+            row = layout.row(align=True)
+            row.prop(settings, "seed")
+            row.prop(settings, "takes")
             layout.prop(settings, "transition_frames")
             layout.prop(settings, "pose_approach_frames")
             layout.prop(settings, "extend_clips")
@@ -531,6 +580,7 @@ class UNIMATE_PT_main(bpy.types.Panel):
             row = layout.row(align=True)
             row.prop(settings, "frames")
             row.prop(settings, "seed")
+            layout.prop(settings, "takes")
             layout.prop(settings, "start_frame")
         if settings.mode == "TIMELINE":
             clips.draw_edit(layout, context)
@@ -542,6 +592,10 @@ class UNIMATE_PT_main(bpy.types.Panel):
         else:
             layout.operator("unimate.generate", icon="PLAY")
         layout.operator("unimate.apply", icon="ACTION")
+        if settings.applied_takes > 1:
+            row = layout.row()
+            row.prop(settings, "take", slider=True)
+            row.label(text=f"of {settings.applied_takes}")
         box = layout.box()
         for line in status_lines(settings.status):
             box.label(text=line)
