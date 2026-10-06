@@ -7,7 +7,7 @@ import time
 import uuid
 import bpy
 import bpy.utils.previews
-from bpy.props import StringProperty, IntProperty, BoolProperty, CollectionProperty
+from bpy.props import StringProperty, IntProperty, BoolProperty, CollectionProperty, EnumProperty
 from bpy_extras.io_utils import ImportHelper
 from .rig import export_skeleton
 from .poses import ROLES, auto_mapping, capture_pose, key_frames, preview_estimate
@@ -26,6 +26,10 @@ class UniMateReference(bpy.types.PropertyGroup):
     frame: IntProperty(name="Reference frame", default=1)
     pose_json: StringProperty()
     estimate_path: StringProperty()
+    blend: EnumProperty(name="At this pose", default="EASE", items=[
+        ("EASE", "Ease in and hold", "Slow into the pose and arrive at rest; suits a pose the motion should stop on"),
+        ("THROUGH", "Keep moving", "Pass through the pose at the motion's own speed; suits keys taken from an animation, such as the contacts of a walk")],
+        description="How the motion meets this pose")
 
 class UniMateClip(bpy.types.PropertyGroup):
     prompt: StringProperty(name="Prompt", default="A human walks forward.",
@@ -54,7 +58,8 @@ def collect_schedule(settings, skeleton, scene):
     clips = []
     for item in settings.clips:
         refs = [dict(frame=r.frame, image_path=bpy.path.abspath(r.image_path) if r.image_path else "",
-                     pose=json.loads(r.pose_json) if r.pose_json else None) for r in item.references]
+                     pose=json.loads(r.pose_json) if r.pose_json else None,
+                     blend="through" if r.blend == "THROUGH" else "ease") for r in item.references]
         clips.append(dict(prompt=item.prompt, start=item.start, end=item.end, references=refs))
     validate_clips(clips, skeleton["signature"])
     return dict(clips=clips, overlap=settings.overlap, fps=scene.render.fps / scene.render.fps_base)
@@ -199,7 +204,7 @@ class UNIMATE_OT_references_from_keys(bpy.types.Operator):
                     raise ValueError(f"Frame {frame}: {exc}") from None
                 ref = clip.references.add()
                 ref.uid = uuid.uuid4().hex
-                ref.frame, ref.pose_json = frame, json.dumps(pose)
+                ref.frame, ref.pose_json, ref.blend = frame, json.dumps(pose), "THROUGH"
                 added.append(frame)
             clip.reference_index = len(clip.references) - 1
             s.status = f"Added {len(added)} pose references from keys at frames " + ", ".join(map(str, added))
@@ -369,6 +374,7 @@ def draw_timeline(layout, context):
             box.prop(clip, "reference_index", text="Reference index (0-based)")
         ref = current_reference(s)
         box.prop(ref, "frame")
+        box.prop(ref, "blend")
         box.prop(ref, "image_path", text="")
         box.operator("unimate.reference_image", icon="FILE_IMAGE")
         if ref.image_path and Path(bpy.path.abspath(ref.image_path)).is_file():

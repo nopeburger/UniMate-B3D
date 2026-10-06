@@ -175,6 +175,45 @@ def inertialize(root, local, cursor, end):
         root[cursor+t] += (root_error + velocity_error*t)*weight
 
 
+def pass_through_keys(root, local, frames, reach):
+    """Make keys part of a moving motion instead of stops.
+
+    The model lands exactly on a pinned pose, but its neighbouring frames do not
+    quite agree, which pops. Measure the pop against the midpoint of the two
+    neighbours and spread that correction over up to `reach` frames on either
+    side as an offset that fades out, so the key stays exact while the motion
+    keeps its own speed (an eased approach would slow to a stop at every key).
+    """
+    from scipy.spatial.transform import Rotation
+    frames = sorted(set(frames))
+    count, joints = local.shape[:2]
+    turns, shifts = np.zeros((count, joints, 3)), np.zeros((count, 3))
+    for index, frame in enumerate(frames):
+        if 0 < frame < count - 1:   # between two frames: compare with their midpoint
+            before, after = local[frame - 1], local[frame + 1]
+            half = Rotation.from_matrix((before.swapaxes(-1, -2) @ after).reshape(-1, 3, 3)).as_rotvec() * .5
+            middle = before @ Rotation.from_rotvec(half).as_matrix().reshape(joints, 3, 3)
+            expected_root = (root[frame - 1] + root[frame + 1]) / 2
+        elif count >= 3:            # first or last frame: continue the motion from the side that exists
+            near, far = (frame + 1, frame + 2) if frame == 0 else (frame - 1, frame - 2)
+            step = local[far].swapaxes(-1, -2) @ local[near]
+            middle = local[near] @ step
+            expected_root = 2 * root[near] - root[far]
+        else:
+            continue
+        turn = Rotation.from_matrix((local[frame] @ middle.swapaxes(-1, -2)).reshape(-1, 3, 3)).as_rotvec()
+        shift = root[frame] - expected_root
+        gaps = ([frame - frames[index - 1]] if index else []) + ([frames[index + 1] - frame] if index + 1 < len(frames) else [])
+        span = max(1, min([reach] + [gap // 2 for gap in gaps]))
+        for other in range(max(0, frame - span), min(count, frame + span + 1)):
+            if other != frame:
+                weight = 1 - ease(abs(other - frame) / (span + 1))
+                turns[other] += turn * weight
+                shifts[other] += shift * weight
+    local[:] = Rotation.from_rotvec(turns.reshape(-1, 3)).as_matrix().reshape(count, joints, 3, 3) @ local
+    root += shifts
+
+
 def finish_motion(root, local, clips, skeleton, transition_frames, pose_approach_frames, window_seams=()):
     """Deterministic editing of neural motion; reference approaches are pose blends.
 
@@ -187,10 +226,13 @@ def finish_motion(root, local, clips, skeleton, transition_frames, pose_approach
         count = clip["end"]-clip["start"]+1
         refs = sorted(clip.get("references", []), key=lambda r: r["frame"])
         targets = [cursor+ref["frame"]-clip["start"] for ref in refs]
+        # Keys taken from an animation are passed through; other references are eased into and held.
+        passing = [t for t, ref in zip(targets, refs) if ref.get("blend") == "through"]
+        all_targets, targets = targets, [t for t in targets if t not in passing]
         # Joins never blend across a reference, so captured targets stay exact.
         joins = ([cursor] if cursor else []) + [seam for seam in window_seams if cursor < seam < cursor+count]
         for join in joins:
-            end = min([join+transition_frames, cursor+count-1] + [t for t in targets if t >= join])
+            end = min([join+transition_frames, cursor+count-1] + [t for t in all_targets if t >= join])
             inertialize(root, local, join, end)
         # Each reference is approached from an earlier pose with zero endpoint
         # speed; local rotations avoid collapsing limbs as their parents turn.
@@ -210,6 +252,8 @@ def finish_motion(root, local, clips, skeleton, transition_frames, pose_approach
                 release = min(target+transition_frames, limit)
                 if release > target:
                     pose_bridge(root, local, target, release, incoming=False)
+        if passing:
+            pass_through_keys(root, local, passing, max(3, transition_frames))
         cursor += count
     return forward_kinematics(root, local, skeleton)
 

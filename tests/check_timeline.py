@@ -7,7 +7,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/"backend"))
-from timeline import retime, forward_kinematics, to_local, native_index, smooth_motion
+from timeline import retime, forward_kinematics, to_local, native_index, smooth_motion, pass_through_keys
 spec = importlib.util.spec_from_file_location("geometry", ROOT/"addon/unimate_motion/motion.py")
 geo = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(geo)
@@ -155,7 +155,34 @@ _free=dict(_sk2,foot_profiles=[])
 _pu,_ru=smooth_motion(_p2,_r2,_free,3.0)
 _amp=lambda p:np.ptp(p[10:-10,3]-p[10:-10,0],axis=0).max()
 assert _amp(_ps2)>_amp(_pu)*1.5 and _amp(_ps2)>_amp(_p2)*.5
-report=dict(passed=["fixed base pins the root","references restored after edits","window joins smoothed","reference exits smoothed","window planning","chained reference slots","exact reference frame","earlier prompt preserved","no sit rotation spike",
+# Keys passed through: a one-frame pop at a key is spread out, the key stays exact and the motion keeps its speed.
+_frames=60
+_swing=np.sin(np.arange(_frames)*.25)*.5
+_loc3=np.tile(np.eye(3),(_frames,3,1,1)); _loc3[:,1]=Rotation.from_rotvec(np.stack([_swing,0*_swing,0*_swing],1)).as_matrix()
+_root3=np.stack([np.zeros(_frames),-.03*np.arange(_frames),np.ones(_frames)],1)
+_loc3[30,1]=Rotation.from_rotvec([.9,0,0]).as_matrix()   # the pinned key pose, off the motion by about 0.6 rad
+_root3[30]+= [0,-.05,.02]
+_key_rot,_key_root=_loc3[30].copy(),_root3[30].copy()
+def _jerk(l):
+    step=Rotation.from_matrix((l[:-1,1].swapaxes(-1,-2)@l[1:,1])).as_rotvec()
+    return np.degrees(np.linalg.norm(np.diff(step,axis=0),axis=-1))
+before=_jerk(_loc3).max()
+pass_through_keys(_root3,_loc3,[30],12)
+assert np.allclose(_loc3[30],_key_rot) and np.allclose(_root3[30],_key_root)
+assert _jerk(_loc3).max()<before*.25, (before,_jerk(_loc3).max())
+_speed=np.linalg.norm(np.diff(_root3[:,:2],axis=0),axis=1)
+assert _speed[20:40].min()>.02, _speed[20:40].min()   # no stop around the key (base speed .03)
+assert np.allclose(_root3[:15],np.stack([np.zeros(15),-.03*np.arange(15),np.ones(15)],1))   # untouched outside the reach
+# A key on the last frame is blended into from the frames before it.
+_loc4=np.tile(np.eye(3),(40,2,1,1)); _loc4[:,1]=Rotation.from_rotvec(np.stack([np.arange(40)*.02,np.zeros(40),np.zeros(40)],1)).as_matrix()
+_loc4[39,1]=Rotation.from_rotvec([1.2,0,0]).as_matrix(); _end=_loc4[39].copy()
+_root4=np.zeros((40,3))
+def _jerk4(l):
+    step=Rotation.from_matrix((l[:-1,1].swapaxes(-1,-2)@l[1:,1])).as_rotvec()
+    return np.degrees(np.linalg.norm(np.diff(step,axis=0),axis=-1))
+_b=_jerk4(_loc4).max(); pass_through_keys(_root4,_loc4,[39],12)
+assert np.allclose(_loc4[39],_end) and _jerk4(_loc4).max()<_b*.25, (_b,_jerk4(_loc4).max())
+report=dict(passed=["keys passed through without a pop or a stop","end keys blended from one side","fixed base pins the root","references restored after edits","window joins smoothed","reference exits smoothed","window planning","chained reference slots","exact reference frame","earlier prompt preserved","no sit rotation spike",
                     "no endpoint root snap","FK bone lengths","disable editing",
                     "multiple and first-frame references","interior reference release",
                     "short and stretched clips","motion smoothing","limbs keep their swing"],

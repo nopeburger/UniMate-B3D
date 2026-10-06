@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "addon"), str(ROOT / "tests")]
 import unimate_motion
 from unimate_motion.poses import key_frames
+from unimate_motion.rig import export_skeleton
 from build_scene import build
 
 unimate_motion.register()
@@ -48,6 +49,9 @@ assert bpy.ops.unimate.references_from_keys(min_gap=10) == {"FINISHED"}, setting
 frames = [r.frame for r in clip.references]
 assert frames == [1, 30, 45, 60], frames          # 33 is within 10 frames of 30
 assert scene.frame_current == 17, scene.frame_current
+assert {r.blend for r in clip.references} == {"THROUGH"}, "keys from an animation are passed through"
+from unimate_motion.clips import collect_schedule
+assert {ref["blend"] for ref in collect_schedule(settings, export_skeleton(human, settings.forward, settings.tips, settings.fingers), scene)["clips"][0]["references"]} == {"through"}
 signatures = {json.loads(r.pose_json)["signature"] for r in clip.references}
 assert len(signatures) == 1
 poses = [np.asarray(json.loads(r.pose_json)["features"]) for r in clip.references]
@@ -68,7 +72,7 @@ clip.start, clip.end = 1, 60
 assert cancelled() and len(clip.references) == before
 
 report = dict(passed=["keys found on pose bones", "thinned to references", "frame restored",
-                      "captured poses differ", "idempotent", "empty clip and rig without Action"], frames=frames)
+                      "captured poses differ", "keys keep moving", "idempotent", "empty clip and rig without Action"], frames=frames)
 (ROOT / "tests" / "artifacts").mkdir(exist_ok=True)
 (ROOT / "tests" / "artifacts" / "keys-blender.json").write_text(json.dumps(report, indent=2))
 print("KEYS_BLENDER_PASSED", json.dumps(report))
